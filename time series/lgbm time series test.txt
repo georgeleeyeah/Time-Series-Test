@@ -1,30 +1,24 @@
 """
-Production LightGBM 12-Month-Sum Forecast Pipeline
-====================================================
-Input:  DataFrame with columns [tin, ds, y] — all historical data (no OOT)
-Output: DataFrame with columns [tin, origin_date, forecast_12m_sum]
+Production LightGBM 12-Month-Sum Forecast Pipeline (Self-Contained)
+====================================================================
+Input:  DataFrame with columns [tin, ds, y] — all historical data
+Output: DataFrame with columns [tin, origin_date, base_12m, predicted_ratio, forecast_12m_sum]
 
-The pipeline:
-  1. Uses ALL input data for training (sliding window generates train rows)
-  2. Internal train/val split is ONLY for early stopping + feature selection
-  3. Final model is trained on ALL training rows
-  4. Produces one forecast per tin using all available history
-  5. You evaluate externally by comparing forecast_12m_sum to your OOT actuals
+Key design:
+  - Trains on ratio (next_12m / trailing_12m) so all tin sizes contribute equally
+  - Converts ratio back to raw dollar forecast at the end
+  - Uses ALL data for final model (internal val is only for early stopping)
+  - 288 features across 18 categories, auto-selected down to what matters
+  - Handles variable tenure, sparse tins, outliers, regime changes
 
 Usage:
     from production_pipeline import run_pipeline
-    
-    df = pd.read_csv("my_data.csv")  # all data before 2025-03
-    
-    forecasts = run_pipeline(
-        df,
-        min_history_months=12,
-        max_origins_per_tin=6,
-        output_dir="./output",
-    )
-    
-    # forecasts: tin | origin_date | forecast_12m_sum
-    # You pull in OOT actuals (2025-03 to 2026-03) and compute median APE yourself
+
+    df = pd.read_csv("my_data.csv")  # columns: tin, ds, y
+    forecasts = run_pipeline(df, min_history_months=12, max_origins_per_tin=6)
+
+    # forecasts DataFrame: tin | origin_date | base_12m | predicted_ratio | forecast_12m_sum
+    # Compare forecast_12m_sum against your OOT actuals externally
 """
 
 import numpy as np
@@ -35,16 +29,453 @@ import warnings
 
 warnings.filterwarnings("ignore")
 
-from lgbm_12m_forecast_pipeline import (
-    prepare_data,
-    fill_missing_months,
-    make_features_for_tin,
-    select_features,
-    tune_hyperparameters,
-    show_feature_importance,
-)
 
-# Override: these columns are NOT features
+# =============================================================================
+# 1. DATA PREPARATION
+# =============================================================================
+
+def prepare_data(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df["ds"] = pd.to_datetime(df["ds"])
+    df["ds"] = df["ds"].dt.to_period("M").dt.to_timestamp()
+    df = df.sort_values(["tin", "ds"]).reset_index(drop=True)
+    df = df.drop_duplicates(subset=["tin", "ds"], keep="last")
+    return df
+
+
+def fill_missing_months(df: pd.DataFrame) -> pd.DataFrame:
+    records = []
+    for tin, grp in df.groupby("tin"):
+        grp = grp.set_index("ds").sort_index()
+        full_range = pd.date_range(grp.index.min(), grp.index.max(), freq="MS")
+        grp = grp.reindex(full_range, fill_value=0)
+        grp["tin"] = tin
+        grp.index.name = "ds"
+        records.append(grp.reset_index())
+    return pd.concat(records, ignore_index=True)
+
+
+def _safe_window(history: np.ndarray, w: int) -> np.ndarray:
+    return history[-w:] if len(history) >= w else history
+
+
+# =============================================================================
+# 2. FEATURE ENGINEERING (288 features)
+# =============================================================================
+
+def make_features_for_tin(cashflows: np.ndarray, origin_idx: int, origin_date: pd.Timestamp) -> dict:
+    history = cashflows[:origin_idx + 1].astype(float)
+    tenure = len(history)
+    eps = 1e-9
+    feats = {}
+
+    # ── TENURE ──
+    feats["tenure"] = tenure
+    feats["tenure_bucket"] = min(tenure // 6, 8)
+    feats["tenure_log"] = np.log1p(tenure)
+
+    # ── TRAILING AGGREGATES ──
+    for w in [1, 2, 3, 6, 9, 12, 18, 24]:
+        win = _safe_window(history, w)
+        feats[f"sum_{w}m"] = win.sum()
+        feats[f"mean_{w}m"] = win.mean()
+        feats[f"std_{w}m"] = win.std()
+        feats[f"min_{w}m"] = win.min()
+        feats[f"max_{w}m"] = win.max()
+        feats[f"median_{w}m"] = np.median(win)
+        feats[f"has_{w}m"] = int(tenure >= w)
+        feats[f"range_pct_{w}m"] = (win.max() - win.min()) / (win.mean() + eps)
+    feats["annualized_rate"] = history.mean() * 12
+    feats["lifetime_sum"] = history.sum()
+    feats["lifetime_mean"] = history.mean()
+    feats["lifetime_std"] = history.std()
+    feats["lifetime_median"] = np.median(history)
+
+    # ── WINDOW RATIOS ──
+    feats["ratio_1m_3m"] = feats["sum_1m"] / (feats["sum_3m"] + eps)
+    feats["ratio_1m_6m"] = feats["sum_1m"] / (feats["sum_6m"] + eps)
+    feats["ratio_1m_12m"] = feats["sum_1m"] / (feats["sum_12m"] + eps)
+    feats["ratio_3m_6m"] = feats["sum_3m"] / (feats["sum_6m"] + eps)
+    feats["ratio_3m_12m"] = feats["sum_3m"] / (feats["sum_12m"] + eps)
+    feats["ratio_6m_12m"] = feats["sum_6m"] / (feats["sum_12m"] + eps)
+    feats["ratio_6m_24m"] = feats["sum_6m"] / (feats["sum_24m"] + eps)
+    feats["ratio_12m_24m"] = feats["sum_12m"] / (feats["sum_24m"] + eps)
+    feats["ratio_recent_to_lifetime"] = _safe_window(history, 3).mean() / (history.mean() + eps)
+    feats["mean_ratio_3m_12m"] = feats["mean_3m"] / (feats["mean_12m"] + eps)
+    feats["mean_ratio_6m_12m"] = feats["mean_6m"] / (feats["mean_12m"] + eps)
+    feats["mean_ratio_1m_6m"] = feats["mean_1m"] / (feats["mean_6m"] + eps)
+
+    # ── YEAR-OVER-YEAR ──
+    if tenure >= 24:
+        prev_12m = history[-24:-12].sum()
+        feats["yoy_growth"] = (feats["sum_12m"] - prev_12m) / (prev_12m + eps)
+        feats["prev_12m_sum"] = prev_12m
+        feats["prev_12m_mean"] = history[-24:-12].mean()
+        feats["yoy_mean_growth"] = (feats["mean_12m"] - feats["prev_12m_mean"]) / (feats["prev_12m_mean"] + eps)
+    else:
+        feats["yoy_growth"] = 0.0
+        feats["prev_12m_sum"] = feats["sum_12m"]
+        feats["prev_12m_mean"] = feats["mean_12m"]
+        feats["yoy_mean_growth"] = 0.0
+    if tenure >= 36:
+        pp12 = history[-36:-24].sum()
+        feats["yoy_growth_2y_ago"] = (history[-24:-12].sum() - pp12) / (pp12 + eps)
+        feats["yoy_acceleration"] = feats["yoy_growth"] - feats["yoy_growth_2y_ago"]
+    else:
+        feats["yoy_growth_2y_ago"] = 0.0
+        feats["yoy_acceleration"] = 0.0
+    feats["same_month_yoy"] = history[-1] / (history[-13] + eps) if tenure >= 13 else 1.0
+
+    # ── TREND ──
+    for label, lb in [("full", min(tenure, 24)), ("12m", min(tenure, 12)), ("6m", min(tenure, 6)), ("3m", min(tenure, 3))]:
+        seg = history[-lb:]
+        x = np.arange(lb, dtype=float)
+        if lb > 2:
+            coeffs = np.polyfit(x, seg, 1)
+            feats[f"slope_{label}"] = coeffs[0]
+            feats[f"slope_{label}_norm"] = coeffs[0] / (seg.mean() + eps)
+            predicted = np.polyval(coeffs, x)
+            ss_res = np.sum((seg - predicted) ** 2)
+            ss_tot = np.sum((seg - seg.mean()) ** 2)
+            feats[f"r2_{label}"] = 1 - ss_res / (ss_tot + eps)
+        else:
+            feats[f"slope_{label}"] = 0.0
+            feats[f"slope_{label}_norm"] = 0.0
+            feats[f"r2_{label}"] = 0.0
+    feats["momentum_6m"] = (history[-6:].mean() - history[-12:-6].mean()) / (history[-12:-6].mean() + eps) if tenure >= 12 else 0.0
+    feats["momentum_12m"] = (history[-12:].mean() - history[-24:-12].mean()) / (history[-24:-12].mean() + eps) if tenure >= 24 else 0.0
+    if tenure >= 12:
+        h1, h2 = history[-12:-6], history[-6:]
+        s1 = np.polyfit(np.arange(len(h1), dtype=float), h1, 1)[0] if len(h1) > 2 else 0.0
+        s2 = np.polyfit(np.arange(len(h2), dtype=float), h2, 1)[0] if len(h2) > 2 else 0.0
+        feats["slope_acceleration"] = s2 - s1
+        feats["slope_acceleration_norm"] = (s2 - s1) / (history[-12:].mean() + eps)
+    else:
+        feats["slope_acceleration"] = 0.0
+        feats["slope_acceleration_norm"] = 0.0
+
+    # ── DIFF / CHANGE ──
+    if tenure >= 3:
+        diffs = np.diff(history[-min(13, tenure):])
+        abs_diffs = np.abs(diffs)
+        shifted = history[-min(13, tenure):-1]
+        pct_changes = diffs / (np.abs(shifted) + eps)
+        feats["mean_diff"] = diffs.mean()
+        feats["std_diff"] = diffs.std()
+        feats["last_diff"] = diffs[-1]
+        feats["mean_abs_diff"] = abs_diffs.mean()
+        feats["max_abs_diff"] = abs_diffs.max()
+        feats["median_abs_diff"] = np.median(abs_diffs)
+        feats["mean_pct_change"] = pct_changes.mean()
+        feats["std_pct_change"] = pct_changes.std()
+        feats["max_pct_change"] = pct_changes.max()
+        feats["min_pct_change"] = pct_changes.min()
+        feats["last_pct_change"] = pct_changes[-1]
+        feats["median_pct_change"] = np.median(pct_changes)
+        feats["pct_months_positive"] = (diffs > 0).mean()
+        feats["pct_months_negative"] = (diffs < 0).mean()
+        feats["pct_months_flat"] = (diffs == 0).mean()
+    else:
+        for f in ["mean_diff", "std_diff", "last_diff", "mean_abs_diff", "max_abs_diff",
+                   "median_abs_diff", "mean_pct_change", "std_pct_change", "max_pct_change",
+                   "min_pct_change", "last_pct_change", "median_pct_change",
+                   "pct_months_positive", "pct_months_negative", "pct_months_flat"]:
+            feats[f] = 0.0
+
+    # ── SEASONALITY ──
+    origin_month = origin_date.month
+    feats["origin_month_sin"] = np.sin(2 * np.pi * origin_month / 12)
+    feats["origin_month_cos"] = np.cos(2 * np.pi * origin_month / 12)
+    feats["origin_month"] = origin_month
+    feats["origin_quarter"] = (origin_month - 1) // 3
+    if tenure >= 24:
+        last_24 = history[-24:]
+        monthly_means = np.array([last_24[i::12].mean() for i in range(12)])
+        overall_mean = monthly_means.mean()
+        seasonal_idx = monthly_means / (overall_mean + eps)
+        feats["seasonal_strength"] = monthly_means.std() / (overall_mean + eps)
+        feats["seasonal_range"] = (monthly_means.max() - monthly_means.min()) / (overall_mean + eps)
+        origin_pos = origin_month - 1
+        forecast_positions = [(origin_pos + i) % 12 for i in range(1, 13)]
+        feats["forecast_seasonal_load"] = seasonal_idx[forecast_positions].mean()
+        feats["forecast_seasonal_std"] = seasonal_idx[forecast_positions].std()
+        feats["forecast_h1_seasonal"] = seasonal_idx[forecast_positions[:6]].mean()
+        feats["forecast_h2_seasonal"] = seasonal_idx[forecast_positions[6:]].mean()
+        peak_pos = int(np.argmax(monthly_means))
+        trough_pos = int(np.argmin(monthly_means))
+        feats["months_to_peak"] = (peak_pos - origin_pos) % 12
+        feats["months_to_trough"] = (trough_pos - origin_pos) % 12
+        feats["peak_trough_ratio"] = monthly_means[peak_pos] / (monthly_means[trough_pos] + eps)
+        yr1 = history[-24:-12]
+        yr2 = history[-12:]
+        corr = np.corrcoef(yr1 / (yr1.mean() + eps), yr2 / (yr2.mean() + eps))[0, 1]
+        feats["seasonal_consistency"] = corr if not np.isnan(corr) else 0.0
+        feats["same_month_yoy_ratio"] = history[-1] / (history[-13] + eps)
+    elif tenure >= 13:
+        feats["same_month_yoy_ratio"] = history[-1] / (history[-13] + eps)
+        for f in ["seasonal_strength", "seasonal_range", "forecast_seasonal_std", "seasonal_consistency"]:
+            feats[f] = 0.0
+        for f in ["forecast_seasonal_load", "forecast_h1_seasonal", "forecast_h2_seasonal"]:
+            feats[f] = 1.0
+        feats["months_to_peak"] = 0
+        feats["months_to_trough"] = 0
+        feats["peak_trough_ratio"] = 1.0
+    else:
+        feats["same_month_yoy_ratio"] = 1.0
+        for f in ["seasonal_strength", "seasonal_range", "forecast_seasonal_std", "seasonal_consistency"]:
+            feats[f] = 0.0
+        for f in ["forecast_seasonal_load", "forecast_h1_seasonal", "forecast_h2_seasonal"]:
+            feats[f] = 1.0
+        feats["months_to_peak"] = 0
+        feats["months_to_trough"] = 0
+        feats["peak_trough_ratio"] = 1.0
+
+    # ── VOLATILITY / SHAPE ──
+    for label, w in [("12m", 12), ("6m", 6), ("lifetime", tenure)]:
+        win = _safe_window(history, w)
+        m = win.mean()
+        feats[f"cv_{label}"] = win.std() / (m + eps)
+        feats[f"iqr_{label}"] = np.percentile(win, 75) - np.percentile(win, 25)
+        feats[f"iqr_pct_{label}"] = feats[f"iqr_{label}"] / (m + eps)
+        feats[f"skew_{label}"] = float(pd.Series(win).skew()) if len(win) >= 4 else 0.0
+        feats[f"kurtosis_{label}"] = float(pd.Series(win).kurtosis()) if len(win) >= 4 else 0.0
+    r12 = _safe_window(history, 12)
+    feats["mad_12m"] = np.mean(np.abs(r12 - r12.mean()))
+    feats["mad_12m_pct"] = feats["mad_12m"] / (r12.mean() + eps)
+
+    # ── OUTLIER DETECTION ──
+    for label, w in [("12m", 12), ("24m", 24)]:
+        win = _safe_window(history, w)
+        if len(win) >= 4:
+            q1, q3 = np.percentile(win, 25), np.percentile(win, 75)
+            iqr = q3 - q1
+            uf, lf = q3 + 1.5 * iqr, q1 - 1.5 * iqr
+            hi, lo = win[win > uf], win[win < lf]
+            feats[f"outlier_high_count_{label}"] = len(hi)
+            feats[f"outlier_low_count_{label}"] = len(lo)
+            feats[f"outlier_total_count_{label}"] = len(hi) + len(lo)
+            feats[f"outlier_frac_{label}"] = (len(hi) + len(lo)) / len(win)
+            feats[f"outlier_high_max_{label}"] = hi.max() if len(hi) > 0 else 0.0
+            feats[f"outlier_high_max_pct_{label}"] = hi.max() / (win.mean() + eps) if len(hi) > 0 else 0.0
+            feats[f"outlier_high_mean_pct_{label}"] = hi.mean() / (win.mean() + eps) if len(hi) > 0 else 0.0
+            feats[f"outlier_low_min_{label}"] = lo.min() if len(lo) > 0 else 0.0
+            feats[f"outlier_low_min_pct_{label}"] = lo.min() / (win.mean() + eps) if len(lo) > 0 else 0.0
+            mask = (win > uf) | (win < lf)
+            if mask.sum() >= 2:
+                pos = np.where(mask)[0]
+                feats[f"outlier_clustered_{label}"] = int(np.any(np.diff(pos) == 1))
+                feats[f"outlier_mean_gap_{label}"] = np.diff(pos).mean()
+            else:
+                feats[f"outlier_clustered_{label}"] = 0
+                feats[f"outlier_mean_gap_{label}"] = float(len(win))
+            feats[f"last_month_is_outlier_{label}"] = int(win[-1] > uf or win[-1] < lf)
+            last3 = win[-min(3, len(win)):]
+            feats[f"recent3_outlier_count_{label}"] = int(np.sum((last3 > uf) | (last3 < lf)))
+        else:
+            for f in [f"outlier_high_count_{label}", f"outlier_low_count_{label}",
+                       f"outlier_total_count_{label}", f"outlier_frac_{label}",
+                       f"outlier_high_max_{label}", f"outlier_high_max_pct_{label}",
+                       f"outlier_high_mean_pct_{label}", f"outlier_low_min_{label}",
+                       f"outlier_low_min_pct_{label}", f"outlier_clustered_{label}",
+                       f"outlier_mean_gap_{label}", f"last_month_is_outlier_{label}",
+                       f"recent3_outlier_count_{label}"]:
+                feats[f] = 0.0
+
+    # ── ROBUST Z-SCORE ──
+    r12 = _safe_window(history, 12)
+    med = np.median(r12)
+    mad = np.median(np.abs(r12 - med)) + eps
+    z_scores = (r12 - med) / (1.4826 * mad)
+    feats["zscore_last_month"] = z_scores[-1]
+    feats["zscore_max_12m"] = z_scores.max()
+    feats["zscore_min_12m"] = z_scores.min()
+    feats["zscore_abs_max_12m"] = np.abs(z_scores).max()
+    feats["months_with_zscore_gt2"] = int(np.sum(np.abs(z_scores) > 2))
+    feats["months_with_zscore_gt3"] = int(np.sum(np.abs(z_scores) > 3))
+    if len(r12) >= 4:
+        sv = np.sort(r12)
+        trim = max(1, len(sv) // 10)
+        wm = sv[trim:-trim].mean()
+        feats["winsorized_mean_12m"] = wm
+        feats["winsorized_vs_mean_ratio"] = wm / (r12.mean() + eps)
+    else:
+        feats["winsorized_mean_12m"] = r12.mean()
+        feats["winsorized_vs_mean_ratio"] = 1.0
+
+    # ── SPARSITY / ZEROS ──
+    for label, w in [("3m", 3), ("6m", 6), ("12m", 12), ("24m", 24), ("life", tenure)]:
+        win = _safe_window(history, w)
+        nz = int((win == 0).sum())
+        feats[f"zero_count_{label}"] = nz
+        feats[f"zero_frac_{label}"] = nz / len(win)
+        thr = win.mean() * 0.01
+        feats[f"near_zero_count_{label}"] = int((win < thr).sum())
+        feats[f"near_zero_frac_{label}"] = (win < thr).mean()
+    is_zero = (history == 0).astype(int)
+    all_runs = []
+    cr = 0
+    for v in is_zero:
+        if v:
+            cr += 1
+        else:
+            if cr > 0:
+                all_runs.append(cr)
+            cr = 0
+    if cr > 0:
+        all_runs.append(cr)
+    feats["max_consec_zeros"] = max(all_runs) if all_runs else 0
+    feats["num_zero_runs"] = len(all_runs)
+    feats["mean_zero_run_length"] = np.mean(all_runs) if all_runs else 0.0
+    feats["median_zero_run_length"] = np.median(all_runs) if all_runs else 0.0
+    feats["ending_on_zeros"] = int(history[-1] == 0)
+    tz = 0
+    for v in reversed(history):
+        if v == 0:
+            tz += 1
+        else:
+            break
+    feats["trailing_zero_count"] = tz
+    feats["trailing_zero_frac"] = tz / tenure
+    zp = np.where(history == 0)[0]
+    feats["months_since_last_zero"] = (tenure - 1 - zp[-1]) if len(zp) > 0 else tenure
+    nzp = np.where(history != 0)[0]
+    feats["months_since_last_nonzero"] = (tenure - 1 - nzp[-1]) if len(nzp) > 0 else tenure
+    feats["is_sparse"] = int(feats["zero_frac_12m"] > 0.25)
+    feats["is_intermittent"] = int(feats["zero_count_12m"] > 0 and tz < feats["zero_count_12m"])
+    r12 = _safe_window(history, 12)
+    nzv = r12[r12 > 0]
+    if len(nzv) > 0:
+        feats["mean_nonzero_12m"] = nzv.mean()
+        feats["std_nonzero_12m"] = nzv.std()
+        feats["cv_nonzero_12m"] = nzv.std() / (nzv.mean() + eps)
+        feats["sum_nonzero_12m"] = nzv.sum()
+        feats["count_nonzero_12m"] = len(nzv)
+    else:
+        for f in ["mean_nonzero_12m", "std_nonzero_12m", "cv_nonzero_12m", "sum_nonzero_12m"]:
+            feats[f] = 0.0
+        feats["count_nonzero_12m"] = 0
+
+    # ── STRUCTURAL BREAK ──
+    if tenure >= 12:
+        r12 = history[-12:]
+        cumdev = np.cumsum(r12 - r12.mean())
+        feats["cusum_range_12m"] = cumdev.max() - cumdev.min()
+        feats["cusum_range_pct_12m"] = feats["cusum_range_12m"] / (r12.sum() + eps)
+        bsd, bsp = 0.0, 0
+        for sp in range(3, len(r12) - 2):
+            d = abs(r12[sp:].mean() - r12[:sp].mean()) / (r12.mean() + eps)
+            if d > bsd:
+                bsd, bsp = d, sp
+        feats["regime_change_magnitude_12m"] = bsd
+        feats["regime_change_position_12m"] = bsp
+        feats["regime_change_recency_12m"] = 12 - bsp
+        feats["regime_change_direction_12m"] = (r12[bsp:].mean() - r12[:bsp].mean()) / (r12[:bsp].mean() + eps) if 0 < bsp < 12 else 0.0
+    else:
+        for f in ["cusum_range_12m", "cusum_range_pct_12m", "regime_change_magnitude_12m",
+                   "regime_change_position_12m", "regime_change_recency_12m", "regime_change_direction_12m"]:
+            feats[f] = 0.0
+    if tenure >= 24:
+        f12, s12 = history[-24:-12].mean(), history[-12:].mean()
+        feats["regime_shift_24m"] = (s12 - f12) / (f12 + eps)
+        feats["regime_shift_24m_abs"] = abs(s12 - f12) / (f12 + eps)
+    else:
+        feats["regime_shift_24m"] = 0.0
+        feats["regime_shift_24m_abs"] = 0.0
+
+    # ── RECENCY / LEVEL-SHIFT ──
+    last_val = history[-1]
+    feats["last_val"] = last_val
+    feats["last_vs_mean_3m"] = last_val / (feats["mean_3m"] + eps)
+    feats["last_vs_mean_6m"] = last_val / (feats["mean_6m"] + eps)
+    feats["last_vs_mean_12m"] = last_val / (feats["mean_12m"] + eps)
+    feats["last_vs_median_12m"] = last_val / (feats["median_12m"] + eps)
+    feats["last_vs_lifetime_mean"] = last_val / (feats["lifetime_mean"] + eps)
+    last2 = _safe_window(history, 2).mean()
+    feats["last2_vs_mean_12m"] = last2 / (feats["mean_12m"] + eps)
+    feats["last2_vs_mean_6m"] = last2 / (feats["mean_6m"] + eps)
+    last3_mean = _safe_window(history, 3).mean()
+    feats["last3_vs_mean_12m"] = last3_mean / (feats["mean_12m"] + eps)
+    feats["last3_vs_mean_6m"] = last3_mean / (feats["mean_6m"] + eps)
+    if tenure >= 2:
+        pv = history[-2]
+        feats["last_vs_prev_month"] = last_val / (pv + eps)
+        feats["last_minus_prev_abs"] = abs(last_val - pv)
+        feats["last_minus_prev_pct"] = (last_val - pv) / (pv + eps)
+    else:
+        feats["last_vs_prev_month"] = 1.0
+        feats["last_minus_prev_abs"] = 0.0
+        feats["last_minus_prev_pct"] = 0.0
+
+    # ── PERCENTILE / RANK ──
+    r12 = _safe_window(history, 12)
+    feats["last_percentile_12m"] = np.mean(r12 <= last_val)
+    feats["last3_percentile_12m"] = np.mean(r12 <= last3_mean)
+    for p in [10, 25, 50, 75, 90]:
+        feats[f"pctl_{p}_12m"] = np.percentile(r12, p)
+        feats[f"pctl_{p}_pct_mean_12m"] = feats[f"pctl_{p}_12m"] / (r12.mean() + eps)
+
+    # ── CONCENTRATION / GINI ──
+    r12 = _safe_window(history, 12)
+    sv = np.sort(np.abs(r12))
+    n = len(sv)
+    tot = sv.sum()
+    feats["gini_12m"] = (2 * np.sum(np.cumsum(sv)) - tot * (n + 1)) / (n * tot) if tot > 0 and n > 1 else 0.0
+    sd = np.sort(r12)[::-1]
+    t12 = r12.sum() + eps
+    feats["top1_month_share"] = sd[0] / t12
+    feats["top3_month_share"] = sd[:min(3, n)].sum() / t12
+    feats["bottom3_month_share"] = sd[-min(3, n):].sum() / t12
+
+    # ── LOG-SCALE ──
+    feats["log_mean_12m"] = np.log1p(max(feats["mean_12m"], 0))
+    feats["log_sum_12m"] = np.log1p(max(feats["sum_12m"], 0))
+    feats["log_mean_6m"] = np.log1p(max(feats["mean_6m"], 0))
+    feats["log_lifetime_mean"] = np.log1p(max(feats["lifetime_mean"], 0))
+    feats["log_last_val"] = np.log1p(max(last_val, 0))
+    feats["log_annualized_rate"] = np.log1p(max(feats["annualized_rate"], 0))
+    feats["log_std_12m"] = np.log1p(max(feats["std_12m"], 0))
+
+    # ── AUTOCORRELATION ──
+    if tenure >= 6:
+        r = _safe_window(history, min(tenure, 24))
+        mr, vr = r.mean(), np.var(r) + eps
+        for lag in [1, 2, 3, 6, 12]:
+            feats[f"autocorr_lag{lag}"] = np.mean((r[lag:] - mr) * (r[:-lag] - mr)) / vr if len(r) > lag else 0.0
+    else:
+        for lag in [1, 2, 3, 6, 12]:
+            feats[f"autocorr_lag{lag}"] = 0.0
+
+    # ── VOLATILITY CHANGE ──
+    if tenure >= 12:
+        feats["vol_change_6m"] = (history[-6:].std() - history[-12:-6].std()) / (history[-12:-6].std() + eps)
+        feats["vol_ratio_6m"] = history[-6:].std() / (history[-12:-6].std() + eps)
+    else:
+        feats["vol_change_6m"] = 0.0
+        feats["vol_ratio_6m"] = 1.0
+    feats["vol_change_12m"] = (history[-12:].std() - history[-24:-12].std()) / (history[-24:-12].std() + eps) if tenure >= 24 else 0.0
+
+    # ── EXTREME VALUES ──
+    r12 = _safe_window(history, 12)
+    feats["max_vs_mean_12m"] = r12.max() / (r12.mean() + eps)
+    feats["min_vs_mean_12m"] = r12.min() / (r12.mean() + eps)
+    feats["max_vs_median_12m"] = r12.max() / (np.median(r12) + eps)
+    feats["range_12m"] = r12.max() - r12.min()
+    feats["range_pct_12m"] = feats["range_12m"] / (r12.mean() + eps)
+    feats["months_since_max_12m"] = len(r12) - 1 - np.argmax(r12)
+    feats["months_since_min_12m"] = len(r12) - 1 - np.argmin(r12)
+    feats["months_since_lifetime_max"] = tenure - 1 - np.argmax(history)
+    feats["months_since_lifetime_min"] = tenure - 1 - np.argmin(history)
+    feats["lifetime_max"] = history.max()
+    feats["lifetime_min"] = history.min()
+    feats["lifetime_max_vs_mean"] = history.max() / (history.mean() + eps)
+
+    return feats
+
+
+# =============================================================================
+# 3. TRAINING / INFERENCE DATA BUILDERS
+# =============================================================================
+
 NON_FEATURE_COLS = {"tin", "origin_date", "target", "target_ratio", "base_12m"}
 
 
@@ -52,200 +483,145 @@ def get_feature_cols(df: pd.DataFrame) -> list:
     return [c for c in df.columns if c not in NON_FEATURE_COLS]
 
 
-# =============================================================================
-# TRAINING DATA: sliding window
-# =============================================================================
-
-def build_training_data(
-    df: pd.DataFrame,
-    min_history_months: int = 12,
-    forecast_horizon: int = 12,
-    max_origins_per_tin: Optional[int] = 6,
-) -> pd.DataFrame:
-    """
-    Build training rows using sliding window.
-    
-    Stores two targets:
-      - target: raw 12-month sum (for reference)
-      - target_ratio: next_12m_sum / trailing_12m_sum (scale-free, what we actually model)
-      - base_12m: trailing 12-month sum at the origin (used to convert ratio back to $)
-    
-    Training on target_ratio means a $100/month tin and a $10,000/month tin
-    contribute equally to the loss. The model learns growth/decline patterns
-    rather than memorizing dollar levels.
-    """
+def build_training_data(df, min_history_months=12, forecast_horizon=12, max_origins_per_tin=6):
     all_rows = []
     for tin, grp in df.groupby("tin"):
         grp = grp.sort_values("ds").reset_index(drop=True)
-        cashflows = grp["y"].values
-        dates = grp["ds"].values
-        n = len(cashflows)
-
-        first_origin = min_history_months - 1
-        last_origin = n - forecast_horizon - 1
-        if first_origin > last_origin:
+        cf, dates = grp["y"].values, grp["ds"].values
+        n = len(cf)
+        first_o = min_history_months - 1
+        last_o = n - forecast_horizon - 1
+        if first_o > last_o:
             continue
-
-        origins = list(range(first_origin, last_origin + 1))
+        origins = list(range(first_o, last_o + 1))
         if max_origins_per_tin and len(origins) > max_origins_per_tin:
             origins = origins[-max_origins_per_tin:]
-
         for oidx in origins:
-            target_raw = cashflows[oidx + 1: oidx + 1 + forecast_horizon].sum()
-            origin_date = pd.Timestamp(dates[oidx])
-            feats = make_features_for_tin(cashflows, oidx, origin_date)
-
-            # Trailing 12m sum as the base for ratio
-            history = cashflows[:oidx + 1]
-            trailing_12m = history[-min(12, len(history)):].sum()
-
+            target_raw = cf[oidx + 1: oidx + 1 + forecast_horizon].sum()
+            od = pd.Timestamp(dates[oidx])
+            feats = make_features_for_tin(cf, oidx, od)
+            hist = cf[:oidx + 1]
+            t12 = hist[-min(12, len(hist)):].sum()
             feats["tin"] = tin
-            feats["origin_date"] = origin_date
+            feats["origin_date"] = od
             feats["target"] = target_raw
-            feats["base_12m"] = trailing_12m
-            # Ratio target: next 12m / trailing 12m (scale-free)
-            feats["target_ratio"] = target_raw / (trailing_12m + 1e-9)
+            feats["base_12m"] = t12
+            feats["target_ratio"] = target_raw / (t12 + 1e-9)
             all_rows.append(feats)
-
     return pd.DataFrame(all_rows)
 
 
-# =============================================================================
-# INFERENCE DATA: one row per tin using all history
-# =============================================================================
-
-def build_inference_data(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    One row per tin. Origin = last month. Features from all history.
-    Includes base_12m (trailing 12m sum) for converting ratio prediction back to $.
-    """
+def build_inference_data(df):
     all_rows = []
     for tin, grp in df.groupby("tin"):
         grp = grp.sort_values("ds").reset_index(drop=True)
-        cashflows = grp["y"].values
-        dates = grp["ds"].values
-        origin_idx = len(cashflows) - 1
-        origin_date = pd.Timestamp(dates[origin_idx])
-        feats = make_features_for_tin(cashflows, origin_idx, origin_date)
+        cf, dates = grp["y"].values, grp["ds"].values
+        oidx = len(cf) - 1
+        od = pd.Timestamp(dates[oidx])
+        feats = make_features_for_tin(cf, oidx, od)
         feats["tin"] = tin
-        feats["origin_date"] = origin_date
-        # Trailing 12m sum — used to convert ratio back to dollars
-        feats["base_12m"] = cashflows[-min(12, len(cashflows)):].sum()
+        feats["origin_date"] = od
+        feats["base_12m"] = cf[-min(12, len(cf)):].sum()
         all_rows.append(feats)
     return pd.DataFrame(all_rows)
 
 
 # =============================================================================
-# TRAIN / VAL SPLIT (internal only — for early stopping & feature selection)
+# 4. FEATURE SELECTION
 # =============================================================================
 
-def internal_train_val_split(train_data: pd.DataFrame, val_frac: float = 0.3) -> tuple:
-    """
-    Split training rows 70/30 by origin date.
-    This is internal only — both sets come from the same historical data.
-    The val set is for early stopping, NOT for final evaluation.
-    """
-    sorted_dates = sorted(train_data["origin_date"].unique())
-    split_idx = max(1, int(len(sorted_dates) * (1 - val_frac)))
-    cutoff = sorted_dates[split_idx - 1]
-    train_set = train_data[train_data["origin_date"] <= cutoff].copy()
-    val_set = train_data[train_data["origin_date"] > cutoff].copy()
+def select_features(train_set, val_set, corr_threshold=0.95, min_importance_pct=0.001,
+                    top_n=None, lgb_params=None, categorical_features=None):
+    all_features = get_feature_cols(train_set)
+    print(f"\n  Starting features: {len(all_features)}")
 
-    # Safety: if either is empty, force a 50/50 split
-    if len(train_set) == 0 or len(val_set) == 0:
-        mid = max(1, len(sorted_dates) // 2)
-        cutoff = sorted_dates[mid - 1]
-        train_set = train_data[train_data["origin_date"] <= cutoff].copy()
-        val_set = train_data[train_data["origin_date"] > cutoff].copy()
+    drop_nzv = [c for c in all_features
+                if train_set[c].dtype not in ("object", "str")
+                and train_set[c].value_counts(normalize=True, dropna=False).iloc[0] > 0.99]
+    remaining = [f for f in all_features if f not in drop_nzv]
+    print(f"  After near-zero-variance removal: {len(remaining)} (dropped {len(drop_nzv)})")
 
-    print(f"  Train: {len(train_set)} rows ({train_set['tin'].nunique()} tins), "
-          f"origins up to {cutoff.date()}")
-    print(f"  Val:   {len(val_set)} rows ({val_set['tin'].nunique()} tins), "
-          f"origins after {cutoff.date()}")
-    print(f"  (Internal split for early stopping only — not for final evaluation)")
-    return train_set, val_set
+    numeric_r = [c for c in remaining if train_set[c].dtype not in ("object", "str")]
+    corr_matrix = train_set[numeric_r].corr().abs()
 
-
-# =============================================================================
-# MODEL TRAINING
-# =============================================================================
-
-def train_model(
-    train_set: pd.DataFrame,
-    val_set: pd.DataFrame,
-    feature_cols: list,
-    lgb_params: Optional[dict] = None,
-    categorical_features: Optional[list] = None,
-    retrain_on_all: bool = True,
-) -> lgb.Booster:
-    """
-    Train LightGBM on target_ratio (next_12m / trailing_12m).
-    
-    Training on the ratio makes the model scale-free:
-    a $100/month tin and a $10,000/month tin contribute equally.
-    
-    If retrain_on_all=True (default), first finds best iteration using
-    train/val split, then retrains on ALL data with that iteration count.
-    """
-    if lgb_params is None:
-        lgb_params = {
-            "objective": "regression",
-            "metric": "mae",
-            "learning_rate": 0.05,
-            "num_leaves": 63,
-            "max_depth": 6,
-            "min_child_samples": 30,
-            "feature_fraction": 0.7,
-            "bagging_fraction": 0.8,
-            "bagging_freq": 5,
-            "reg_alpha": 0.1,
-            "reg_lambda": 1.0,
-            "verbosity": -1,
-            "n_jobs": -1,
-            "seed": 42,
-        }
-
+    qp = {"objective": "regression", "metric": "mae", "learning_rate": 0.1, "num_leaves": 63,
+           "min_child_samples": 50, "feature_fraction": 0.8, "bagging_fraction": 0.8,
+           "bagging_freq": 5, "verbosity": -1, "n_jobs": -1, "seed": 42}
     if categorical_features is None:
         categorical_features = ["origin_month", "origin_quarter", "tenure_bucket"]
-    cat_feats = [c for c in categorical_features if c in feature_cols]
+    cat_feats = [c for c in categorical_features if c in remaining]
 
-    # Train on target_ratio (scale-free)
-    dtrain = lgb.Dataset(
-        train_set[feature_cols], label=train_set["target_ratio"],
-        categorical_feature=cat_feats, free_raw_data=False,
-    )
-    dval = lgb.Dataset(
-        val_set[feature_cols], label=val_set["target_ratio"],
-        categorical_feature=cat_feats, reference=dtrain, free_raw_data=False,
-    )
+    dtrain = lgb.Dataset(train_set[remaining], label=train_set["target"], categorical_feature=cat_feats, free_raw_data=False)
+    dval = lgb.Dataset(val_set[remaining], label=val_set["target"], categorical_feature=cat_feats, reference=dtrain, free_raw_data=False)
+    pm = lgb.train(qp, dtrain, num_boost_round=500, valid_sets=[dval], valid_names=["val"],
+                   callbacks=[lgb.early_stopping(30), lgb.log_evaluation(0)])
+    imp_lookup = dict(zip(pm.feature_name(), pm.feature_importance(importance_type="gain")))
 
-    model = lgb.train(
-        lgb_params, dtrain, num_boost_round=3000,
-        valid_sets=[dtrain, dval], valid_names=["train", "val"],
-        callbacks=[lgb.early_stopping(50), lgb.log_evaluation(200)],
-    )
+    upper_tri = corr_matrix.where(np.triu(np.ones(corr_matrix.shape, dtype=bool), k=1))
+    drop_corr = set()
+    for col in upper_tri.columns:
+        for row in upper_tri.index:
+            if upper_tri.loc[row, col] > corr_threshold:
+                drop_corr.add(row if imp_lookup.get(row, 0) < imp_lookup.get(col, 0) else col)
+    remaining = [f for f in remaining if f not in drop_corr]
+    print(f"  After correlation removal (>{corr_threshold}): {len(remaining)} (dropped {len(drop_corr)})")
+
+    total_imp = sum(imp_lookup.get(f, 0) for f in remaining)
+    if total_imp > 0:
+        drop_low = [f for f in remaining if imp_lookup.get(f, 0) / total_imp < min_importance_pct]
+        remaining = [f for f in remaining if f not in drop_low]
+        print(f"  After low-importance removal (<{min_importance_pct*100}%): {len(remaining)} (dropped {len(drop_low)})")
+
+    if top_n and len(remaining) > top_n:
+        remaining = sorted(remaining, key=lambda f: imp_lookup.get(f, 0), reverse=True)[:top_n]
+        print(f"  After top-N cap: {len(remaining)}")
+
+    report_rows = []
+    for f in all_features:
+        imp = imp_lookup.get(f, 0)
+        imp_pct = imp / total_imp * 100 if total_imp > 0 else 0
+        if f in drop_nzv:
+            s = "dropped_nzv"
+        elif f in drop_corr:
+            s = "dropped_corr"
+        elif f not in remaining:
+            s = "dropped_low_imp"
+        else:
+            s = "selected"
+        report_rows.append({"feature": f, "importance": imp, "importance_pct": round(imp_pct, 4), "status": s})
+    report = pd.DataFrame(report_rows).sort_values("importance", ascending=False).reset_index(drop=True)
+    print(f"\n  FINAL: {(report['status']=='selected').sum()} features selected out of {len(all_features)}")
+    return remaining, report
+
+
+# =============================================================================
+# 5. MODEL TRAINING
+# =============================================================================
+
+def train_model(train_set, val_set, feature_cols, lgb_params=None, retrain_on_all=True):
+    if lgb_params is None:
+        lgb_params = {"objective": "regression", "metric": "mae", "learning_rate": 0.05,
+                      "num_leaves": 63, "max_depth": 6, "min_child_samples": 30,
+                      "feature_fraction": 0.7, "bagging_fraction": 0.8, "bagging_freq": 5,
+                      "reg_alpha": 0.1, "reg_lambda": 1.0, "verbosity": -1, "n_jobs": -1, "seed": 42}
+    cat_feats = [c for c in ["origin_month", "origin_quarter", "tenure_bucket"] if c in feature_cols]
+    dtrain = lgb.Dataset(train_set[feature_cols], label=train_set["target_ratio"], categorical_feature=cat_feats, free_raw_data=False)
+    dval = lgb.Dataset(val_set[feature_cols], label=val_set["target_ratio"], categorical_feature=cat_feats, reference=dtrain, free_raw_data=False)
+    model = lgb.train(lgb_params, dtrain, num_boost_round=3000, valid_sets=[dtrain, dval], valid_names=["train", "val"],
+                      callbacks=[lgb.early_stopping(50), lgb.log_evaluation(200)])
     best_iter = model.best_iteration
     print(f"\n  Best iteration (from val): {best_iter}")
-
     if retrain_on_all:
-        print(f"  Retraining on ALL {len(train_set) + len(val_set)} rows "
-              f"with {best_iter} iterations...")
+        print(f"  Retraining on ALL {len(train_set)+len(val_set)} rows with {best_iter} iterations...")
         all_data = pd.concat([train_set, val_set], ignore_index=True)
-        dall = lgb.Dataset(
-            all_data[feature_cols], label=all_data["target_ratio"],
-            categorical_feature=cat_feats, free_raw_data=False,
-        )
-        model = lgb.train(
-            lgb_params, dall, num_boost_round=best_iter,
-            callbacks=[lgb.log_evaluation(0)],
-        )
+        dall = lgb.Dataset(all_data[feature_cols], label=all_data["target_ratio"], categorical_feature=cat_feats, free_raw_data=False)
+        model = lgb.train(lgb_params, dall, num_boost_round=best_iter, callbacks=[lgb.log_evaluation(0)])
         print(f"  Final model trained on {len(all_data)} rows.")
-
     return model
 
 
 # =============================================================================
-# PIPELINE
+# 6. PIPELINE
 # =============================================================================
 
 def run_pipeline(
@@ -253,206 +629,101 @@ def run_pipeline(
     min_history_months: int = 12,
     max_origins_per_tin: Optional[int] = 6,
     lgb_params: Optional[dict] = None,
-    # Feature selection
     do_feature_selection: bool = True,
     corr_threshold: float = 0.95,
     min_importance_pct: float = 0.001,
     top_n_features: Optional[int] = None,
-    # Tuning
-    do_tune: bool = False,
-    tune_n_trials: int = 50,
-    tune_cv_folds: int = 3,
-    # Output
     output_dir: Optional[str] = None,
 ) -> pd.DataFrame:
     """
-    Production pipeline: train on ALL data, forecast next 12m for each tin.
+    Train on ALL data, forecast next 12m sum for each tin.
 
-    Parameters
-    ----------
-    df : all historical data [tin, ds, y] — everything before your OOT cutoff
-    min_history_months : minimum history months at each origin (default 12)
-    max_origins_per_tin : training rows per tin (default 6, controls memory)
-    lgb_params : LightGBM params (None = use defaults or tuned)
-    do_feature_selection : run multi-stage feature selection (default True)
-    do_tune : run hyperparameter tuning (default False)
-    output_dir : save all artifacts to this dir (default None = don't save)
-
-    Returns
-    -------
-    pd.DataFrame: tin | origin_date | forecast_12m_sum
+    Returns: DataFrame [tin, origin_date, base_12m, predicted_ratio, forecast_12m_sum]
     """
-    import pickle
-    import os
+    import pickle, os
 
-    def _save(obj, filename):
-        if output_dir is None:
-            return
+    def _save(obj, fn):
+        if output_dir is None: return
         os.makedirs(output_dir, exist_ok=True)
-        path = os.path.join(output_dir, filename)
-        if filename.endswith(".txt"):
-            obj.save_model(path)
-        elif filename.endswith(".pkl"):
-            with open(path, "wb") as f:
-                pickle.dump(obj, f, protocol=pickle.HIGHEST_PROTOCOL)
-        print(f"    -> Saved: {path}")
+        p = os.path.join(output_dir, fn)
+        if fn.endswith(".txt"): obj.save_model(p)
+        elif fn.endswith(".pkl"):
+            with open(p, "wb") as f: pickle.dump(obj, f, protocol=pickle.HIGHEST_PROTOCOL)
+        print(f"    -> Saved: {p}")
 
-    if output_dir:
-        print(f"  Artifacts will be saved to: {output_dir}/\n")
+    if output_dir: print(f"  Artifacts: {output_dir}/\n")
 
-    # ── STEP 1: Prepare ──
-    print("=" * 60)
-    print("STEP 1: Preparing data")
-    print("=" * 60)
+    # Step 1: Prepare
+    print("=" * 60 + "\nSTEP 1: Preparing data\n" + "=" * 60)
     df = prepare_data(df)
     df = fill_missing_months(df)
-    print(f"  {df['tin'].nunique()} tins, {len(df)} rows")
-    print(f"  Date range: {df['ds'].min().date()} to {df['ds'].max().date()}")
+    print(f"  {df['tin'].nunique()} tins, {len(df)} rows, {df['ds'].min().date()} to {df['ds'].max().date()}")
     _save(df, "01_prepared_data.pkl")
 
-    # ── STEP 2: Build training rows ──
-    print("\n" + "=" * 60)
-    print("STEP 2: Building training rows (sliding window)")
-    print("=" * 60)
-    train_data = build_training_data(
-        df, min_history_months=min_history_months,
-        forecast_horizon=12, max_origins_per_tin=max_origins_per_tin,
-    )
-    print(f"  {len(train_data)} rows from {train_data['tin'].nunique()} tins")
-    print(f"  {len(get_feature_cols(train_data))} features")
+    # Step 2: Training rows
+    print("\n" + "=" * 60 + "\nSTEP 2: Building training rows\n" + "=" * 60)
+    train_data = build_training_data(df, min_history_months=min_history_months, max_origins_per_tin=max_origins_per_tin)
+    print(f"  {len(train_data)} rows, {train_data['tin'].nunique()} tins, {len(get_feature_cols(train_data))} features")
     _save(train_data, "02_train_data.pkl")
+    if len(train_data) == 0: raise ValueError("No training rows.")
 
-    if len(train_data) == 0:
-        raise ValueError("No training rows. Try lowering min_history_months.")
-
-    # ── STEP 3: Internal train/val split ──
-    print("\n" + "=" * 60)
-    print("STEP 3: Internal train/val split (for early stopping only)")
-    print("=" * 60)
-    train_set, val_set = internal_train_val_split(train_data)
+    # Step 3: Internal split
+    print("\n" + "=" * 60 + "\nSTEP 3: Internal train/val split (early stopping only)\n" + "=" * 60)
+    sd = sorted(train_data["origin_date"].unique())
+    si = max(1, int(len(sd) * 0.7))
+    cutoff = sd[si - 1]
+    train_set = train_data[train_data["origin_date"] <= cutoff].copy()
+    val_set = train_data[train_data["origin_date"] > cutoff].copy()
+    if len(train_set) == 0 or len(val_set) == 0:
+        mid = max(1, len(sd) // 2)
+        cutoff = sd[mid - 1]
+        train_set = train_data[train_data["origin_date"] <= cutoff].copy()
+        val_set = train_data[train_data["origin_date"] > cutoff].copy()
+    print(f"  Train: {len(train_set)} rows, Val: {len(val_set)} rows (cutoff: {cutoff.date()})")
     _save(train_set, "03_train_set.pkl")
     _save(val_set, "04_val_set.pkl")
 
-    # ── STEP 4: Feature selection ──
-    # select_features internally uses the 'target' column, so we temporarily
-    # swap it to target_ratio so feature selection is also scale-free
+    # Step 4: Feature selection (on ratio target)
     selected_features = get_feature_cols(train_set)
     selection_report = None
     if do_feature_selection:
-        print("\n" + "=" * 60)
-        print("STEP 4: Feature Selection")
-        print("=" * 60)
-        # Drop columns that shouldn't be seen, rename ratio→target
-        drop_cols = ["target", "base_12m"]
-        keep_cols = [c for c in train_set.columns if c not in drop_cols]
-        train_sel = train_set[keep_cols].rename(columns={"target_ratio": "target"})
-        val_sel = val_set[keep_cols].rename(columns={"target_ratio": "target"})
+        print("\n" + "=" * 60 + "\nSTEP 4: Feature Selection\n" + "=" * 60)
+        drop = ["target", "base_12m"]
+        keep = [c for c in train_set.columns if c not in drop]
+        ts = train_set[keep].rename(columns={"target_ratio": "target"})
+        vs = val_set[keep].rename(columns={"target_ratio": "target"})
         selected_features, selection_report = select_features(
-            train_sel, val_sel,
-            corr_threshold=corr_threshold,
-            min_importance_pct=min_importance_pct,
-            top_n=top_n_features,
-            lgb_params=lgb_params,
-        )
+            ts, vs, corr_threshold=corr_threshold, min_importance_pct=min_importance_pct, top_n=top_n_features)
         _save(selection_report, "05_selection_report.pkl")
     _save(selected_features, "06_selected_features.pkl")
 
-    # ── STEP 5: Tuning (optional) ──
-    tuning_log = None
-    if do_tune and lgb_params is None:
-        print("\n" + "=" * 60)
-        print(f"STEP 5: Hyperparameter Tuning ({tune_n_trials} trials)")
-        print("=" * 60)
-        lgb_params, tuning_log = tune_hyperparameters(
-            train_set, selected_features,
-            n_folds=tune_cv_folds,
-            n_trials=tune_n_trials,
-        )
-        _save(tuning_log, "07_tuning_log.pkl")
-        _save(lgb_params, "07b_best_params.pkl")
+    # Step 5: Train
+    print("\n" + "=" * 60 + f"\nSTEP 5: Training model ({len(selected_features)} features)\n" + "=" * 60)
+    model = train_model(train_set, val_set, feature_cols=selected_features, lgb_params=lgb_params)
+    _save(model, "07_model.txt")
 
-    # ── STEP 6: Train final model on ALL training rows ──
-    print("\n" + "=" * 60)
-    print(f"STEP 6: Training final model ({len(selected_features)} features)")
-    print("=" * 60)
-    model = train_model(
-        train_set, val_set,
-        feature_cols=selected_features,
-        lgb_params=lgb_params,
-        retrain_on_all=True,  # uses val to find best iter, then retrains on everything
-    )
-    _save(model, "08_lgbm_model.txt")
+    # Step 6: Feature importance
+    print("\n" + "=" * 60 + "\nSTEP 6: Feature Importance\n" + "=" * 60)
+    imp = model.feature_importance(importance_type="gain")
+    imp_df = pd.DataFrame({"feature": model.feature_name(), "importance": imp}).sort_values("importance", ascending=False)
+    for _, r in imp_df.head(30).iterrows():
+        print(f"  {r['feature']:40s} {r['importance']:.1f}")
+    _save(imp_df, "08_feature_importance.pkl")
 
-    # ── STEP 7: Feature importance ──
-    print("\n" + "=" * 60)
-    print("STEP 7: Feature Importance")
-    print("=" * 60)
-    imp_df = show_feature_importance(model)
-    _save(imp_df, "09_feature_importance.pkl")
+    # Step 7: Forecast
+    print("\n" + "=" * 60 + "\nSTEP 7: Forecasting\n" + "=" * 60)
+    inf = build_inference_data(df)
+    pred_ratio = model.predict(inf[selected_features])
+    inf["predicted_ratio"] = pred_ratio
+    inf["forecast_12m_sum"] = pred_ratio * inf["base_12m"]
+    forecasts = inf[["tin", "origin_date", "base_12m", "predicted_ratio", "forecast_12m_sum"]].copy()
+    print(f"  {len(forecasts)} tins | ratio: {pred_ratio.min():.3f} to {pred_ratio.max():.3f} | "
+          f"forecast: {forecasts['forecast_12m_sum'].min():,.0f} to {forecasts['forecast_12m_sum'].max():,.0f}")
+    _save(inf, "09_inference_features.pkl")
+    _save(forecasts, "10_forecasts.pkl")
 
-    # ── STEP 8: Forecast ──
-    print("\n" + "=" * 60)
-    print("STEP 8: Generating forecasts (one per tin, using all history)")
-    print("=" * 60)
-    inference_data = build_inference_data(df)
-
-    # Model predicts the RATIO (next_12m / trailing_12m)
-    predicted_ratio = model.predict(inference_data[selected_features])
-
-    # Convert back to dollars: ratio × base_12m
-    inference_data["predicted_ratio"] = predicted_ratio
-    inference_data["forecast_12m_sum"] = predicted_ratio * inference_data["base_12m"]
-
-    forecasts = inference_data[["tin", "origin_date", "base_12m",
-                                "predicted_ratio", "forecast_12m_sum"]].copy()
-    print(f"  {len(forecasts)} tins forecasted")
-    print(f"  Predicted ratio — min: {predicted_ratio.min():.3f}, "
-          f"median: {np.median(predicted_ratio):.3f}, "
-          f"max: {predicted_ratio.max():.3f}")
-    print(f"  Forecast 12m sum — min: {forecasts['forecast_12m_sum'].min():,.0f}, "
-          f"median: {forecasts['forecast_12m_sum'].median():,.0f}, "
-          f"max: {forecasts['forecast_12m_sum'].max():,.0f}")
-    _save(inference_data, "10_inference_features.pkl")
-    _save(forecasts, "11_forecasts.pkl")
-
-    if output_dir:
-        print(f"\n  All artifacts saved to: {output_dir}/")
-
-    run_pipeline.last_results = {
-        "model": model,
-        "selected_features": selected_features,
-        "selection_report": selection_report,
-        "tuning_log": tuning_log,
-        "lgb_params_used": lgb_params,
-        "feature_importance": imp_df,
-        "inference_features": inference_data,
-    }
-
+    if output_dir: print(f"\n  All saved to: {output_dir}/")
+    run_pipeline.last_results = {"model": model, "selected_features": selected_features,
+                                  "selection_report": selection_report, "feature_importance": imp_df,
+                                  "lgb_params_used": lgb_params, "inference_features": inf}
     return forecasts
-
-
-if __name__ == "__main__":
-    np.random.seed(42)
-    rows = []
-    for i in range(500):
-        tenure = np.random.randint(24, 46)
-        end = pd.Timestamp("2025-02-01")
-        start = end - pd.DateOffset(months=tenure - 1)
-        dates = pd.date_range(start, periods=tenure, freq="MS")
-        base = np.random.uniform(1000, 50000)
-        trend = np.random.uniform(-50, 100)
-        values = [
-            max(base + trend * t + np.random.normal(0, base * 0.1), 0)
-            for t in range(tenure)
-        ]
-        for d, v in zip(dates, values):
-            rows.append({"tin": f"TIN_{i:04d}", "ds": d, "y": v})
-
-    df = pd.DataFrame(rows)
-    forecasts = run_pipeline(
-        df,
-        min_history_months=12,
-        max_origins_per_tin=6,
-        output_dir="./prod_output",
-    )
-    print(f"\n\nForecasts:\n{forecasts.head(10).to_string(index=False)}")
