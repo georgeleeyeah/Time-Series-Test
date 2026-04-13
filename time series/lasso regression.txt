@@ -1,473 +1,237 @@
 """
-Linear Regression Pipeline: Seasonal Naive + Feature Correction
-================================================================
-Model: forecast = α × snaive + β₁×feature₁ + β₂×feature₂ + ... + intercept
+Segmented Linear Regression Pipeline
+======================================
+Splits tins into segments based on behavior, trains a separate
+linear model (seasonal naive + correction) for each segment.
 
-Seasonal naive (trailing 12m sum) enters as the primary predictor.
-LightGBM-selected features enter as corrections on top of it.
-All in log space so different tin scales are handled naturally.
-
-This gives you:
-  - Interpretable coefficients (α should be close to 1.0)
-  - No black box — you can see exactly how each feature adjusts the forecast
-  - Guaranteed to be at least as good as naive if regularized properly
-  - Fast to train (seconds, not minutes)
+Segments:
+  1. Stable       — low CV, weak trend, no zeros → barely touch naive
+  2. Trending Up  — strong positive slope → naive underpredicts
+  3. Trending Down— strong negative slope → naive overpredicts
+  4. Sparse       — >25% zero months → different dynamics entirely
+  5. Regime Change— big level shift recently → naive uses wrong level
+  6. Volatile     — high CV but none of the above → cautious correction
 
 Usage:
-    from linear_pipeline import run_pipeline
-    
+    from segmented_pipeline import run_segmented_pipeline
+
     df = pd.read_csv("my_data.csv")  # columns: tin, ds, y
-    forecasts = run_pipeline(df, min_history_months=12, max_origins_per_tin=6)
+    forecasts = run_segmented_pipeline(df, min_history_months=12, max_origins_per_tin=6)
+
+    # Output: tin | origin_date | segment | snaive_12m | correction | forecast_12m_sum
 """
 
 import numpy as np
 import pandas as pd
-from sklearn.linear_model import Ridge, Lasso, ElasticNet
+from sklearn.linear_model import Ridge, Lasso
 from sklearn.preprocessing import StandardScaler
 from typing import Optional
-import warnings
-import pickle
-import os
+import pickle, os, warnings
 
 warnings.filterwarnings("ignore")
 
+# Import shared functions from linear_pipeline
+from linear_pipeline import (
+    prepare_data,
+    fill_missing_months,
+    make_features_for_tin,
+    build_training_data,
+    build_inference_data,
+    select_features_linear,
+)
 
-# =============================================================================
-# 1. DATA PREPARATION (same as LightGBM pipeline)
-# =============================================================================
-
-def prepare_data(df):
-    df = df.copy()
-    df["ds"] = pd.to_datetime(df["ds"])
-    df["ds"] = df["ds"].dt.to_period("M").dt.to_timestamp()
-    df = df.sort_values(["tin", "ds"]).reset_index(drop=True)
-    df = df.drop_duplicates(subset=["tin", "ds"], keep="last")
-    return df
-
-
-def fill_missing_months(df):
-    records = []
-    for tin, grp in df.groupby("tin"):
-        grp = grp.set_index("ds").sort_index()
-        full_range = pd.date_range(grp.index.min(), grp.index.max(), freq="MS")
-        grp = grp.reindex(full_range, fill_value=0)
-        grp["tin"] = tin
-        grp.index.name = "ds"
-        records.append(grp.reset_index())
-    return pd.concat(records, ignore_index=True)
-
-
-def _safe_window(history, w):
-    return history[-w:] if len(history) >= w else history
-
-
-# =============================================================================
-# 2. FEATURE ENGINEERING (same make_features_for_tin as LightGBM pipeline)
-# =============================================================================
-
-def make_features_for_tin(cashflows, origin_idx, origin_date):
-    """Full 288-feature set — identical to the LightGBM pipeline."""
-    history = cashflows[:origin_idx + 1].astype(float)
-    tenure = len(history)
-    eps = 1e-9
-    feats = {}
-
-    feats["tenure"] = tenure
-    feats["tenure_bucket"] = min(tenure // 6, 8)
-    feats["tenure_log"] = np.log1p(tenure)
-
-    for w in [1, 2, 3, 6, 9, 12, 18, 24]:
-        win = _safe_window(history, w)
-        feats[f"sum_{w}m"] = win.sum()
-        feats[f"mean_{w}m"] = win.mean()
-        feats[f"std_{w}m"] = win.std()
-        feats[f"min_{w}m"] = win.min()
-        feats[f"max_{w}m"] = win.max()
-        feats[f"median_{w}m"] = np.median(win)
-        feats[f"has_{w}m"] = int(tenure >= w)
-        feats[f"range_pct_{w}m"] = (win.max() - win.min()) / (win.mean() + eps)
-    feats["annualized_rate"] = history.mean() * 12
-    feats["lifetime_sum"] = history.sum()
-    feats["lifetime_mean"] = history.mean()
-    feats["lifetime_std"] = history.std()
-    feats["lifetime_median"] = np.median(history)
-
-    feats["ratio_1m_3m"] = feats["sum_1m"] / (feats["sum_3m"] + eps)
-    feats["ratio_1m_6m"] = feats["sum_1m"] / (feats["sum_6m"] + eps)
-    feats["ratio_1m_12m"] = feats["sum_1m"] / (feats["sum_12m"] + eps)
-    feats["ratio_3m_6m"] = feats["sum_3m"] / (feats["sum_6m"] + eps)
-    feats["ratio_3m_12m"] = feats["sum_3m"] / (feats["sum_12m"] + eps)
-    feats["ratio_6m_12m"] = feats["sum_6m"] / (feats["sum_12m"] + eps)
-    feats["ratio_6m_24m"] = feats["sum_6m"] / (feats["sum_24m"] + eps)
-    feats["ratio_12m_24m"] = feats["sum_12m"] / (feats["sum_24m"] + eps)
-    feats["ratio_recent_to_lifetime"] = _safe_window(history, 3).mean() / (history.mean() + eps)
-    feats["mean_ratio_3m_12m"] = feats["mean_3m"] / (feats["mean_12m"] + eps)
-    feats["mean_ratio_6m_12m"] = feats["mean_6m"] / (feats["mean_12m"] + eps)
-    feats["mean_ratio_1m_6m"] = feats["mean_1m"] / (feats["mean_6m"] + eps)
-
-    if tenure >= 24:
-        prev_12m = history[-24:-12].sum()
-        feats["yoy_growth"] = (feats["sum_12m"] - prev_12m) / (prev_12m + eps)
-        feats["prev_12m_sum"] = prev_12m
-        feats["prev_12m_mean"] = history[-24:-12].mean()
-        feats["yoy_mean_growth"] = (feats["mean_12m"] - feats["prev_12m_mean"]) / (feats["prev_12m_mean"] + eps)
-    else:
-        feats["yoy_growth"] = 0.0
-        feats["prev_12m_sum"] = feats["sum_12m"]
-        feats["prev_12m_mean"] = feats["mean_12m"]
-        feats["yoy_mean_growth"] = 0.0
-    if tenure >= 36:
-        pp12 = history[-36:-24].sum()
-        feats["yoy_growth_2y_ago"] = (history[-24:-12].sum() - pp12) / (pp12 + eps)
-        feats["yoy_acceleration"] = feats["yoy_growth"] - feats["yoy_growth_2y_ago"]
-    else:
-        feats["yoy_growth_2y_ago"] = 0.0
-        feats["yoy_acceleration"] = 0.0
-    feats["same_month_yoy"] = history[-1] / (history[-13] + eps) if tenure >= 13 else 1.0
-
-    for label, lb in [("full", min(tenure, 24)), ("12m", min(tenure, 12)), ("6m", min(tenure, 6)), ("3m", min(tenure, 3))]:
-        seg = history[-lb:]
-        x = np.arange(lb, dtype=float)
-        if lb > 2:
-            coeffs = np.polyfit(x, seg, 1)
-            feats[f"slope_{label}"] = coeffs[0]
-            feats[f"slope_{label}_norm"] = coeffs[0] / (seg.mean() + eps)
-            predicted = np.polyval(coeffs, x)
-            ss_res = np.sum((seg - predicted) ** 2)
-            ss_tot = np.sum((seg - seg.mean()) ** 2)
-            feats[f"r2_{label}"] = 1 - ss_res / (ss_tot + eps)
-        else:
-            feats[f"slope_{label}"] = 0.0
-            feats[f"slope_{label}_norm"] = 0.0
-            feats[f"r2_{label}"] = 0.0
-    feats["momentum_6m"] = (history[-6:].mean() - history[-12:-6].mean()) / (history[-12:-6].mean() + eps) if tenure >= 12 else 0.0
-    feats["momentum_12m"] = (history[-12:].mean() - history[-24:-12].mean()) / (history[-24:-12].mean() + eps) if tenure >= 24 else 0.0
-    if tenure >= 12:
-        h1, h2 = history[-12:-6], history[-6:]
-        s1 = np.polyfit(np.arange(len(h1), dtype=float), h1, 1)[0] if len(h1) > 2 else 0.0
-        s2 = np.polyfit(np.arange(len(h2), dtype=float), h2, 1)[0] if len(h2) > 2 else 0.0
-        feats["slope_acceleration"] = s2 - s1
-        feats["slope_acceleration_norm"] = (s2 - s1) / (history[-12:].mean() + eps)
-    else:
-        feats["slope_acceleration"] = 0.0
-        feats["slope_acceleration_norm"] = 0.0
-
-    if tenure >= 3:
-        diffs = np.diff(history[-min(13, tenure):])
-        abs_diffs = np.abs(diffs)
-        shifted = history[-min(13, tenure):-1]
-        pct_changes = diffs / (np.abs(shifted) + eps)
-        feats["mean_diff"] = diffs.mean(); feats["std_diff"] = diffs.std(); feats["last_diff"] = diffs[-1]
-        feats["mean_abs_diff"] = abs_diffs.mean(); feats["max_abs_diff"] = abs_diffs.max(); feats["median_abs_diff"] = np.median(abs_diffs)
-        feats["mean_pct_change"] = pct_changes.mean(); feats["std_pct_change"] = pct_changes.std()
-        feats["max_pct_change"] = pct_changes.max(); feats["min_pct_change"] = pct_changes.min()
-        feats["last_pct_change"] = pct_changes[-1]; feats["median_pct_change"] = np.median(pct_changes)
-        feats["pct_months_positive"] = (diffs > 0).mean(); feats["pct_months_negative"] = (diffs < 0).mean(); feats["pct_months_flat"] = (diffs == 0).mean()
-    else:
-        for f in ["mean_diff","std_diff","last_diff","mean_abs_diff","max_abs_diff","median_abs_diff",
-                   "mean_pct_change","std_pct_change","max_pct_change","min_pct_change","last_pct_change",
-                   "median_pct_change","pct_months_positive","pct_months_negative","pct_months_flat"]:
-            feats[f] = 0.0
-
-    origin_month = origin_date.month
-    feats["origin_month_sin"] = np.sin(2 * np.pi * origin_month / 12)
-    feats["origin_month_cos"] = np.cos(2 * np.pi * origin_month / 12)
-    feats["origin_month"] = origin_month
-    feats["origin_quarter"] = (origin_month - 1) // 3
-    if tenure >= 24:
-        last_24 = history[-24:]
-        monthly_means = np.array([last_24[i::12].mean() for i in range(12)])
-        overall_mean = monthly_means.mean()
-        seasonal_idx = monthly_means / (overall_mean + eps)
-        feats["seasonal_strength"] = monthly_means.std() / (overall_mean + eps)
-        feats["seasonal_range"] = (monthly_means.max() - monthly_means.min()) / (overall_mean + eps)
-        origin_pos = origin_month - 1
-        fp = [(origin_pos + i) % 12 for i in range(1, 13)]
-        feats["forecast_seasonal_load"] = seasonal_idx[fp].mean()
-        feats["forecast_seasonal_std"] = seasonal_idx[fp].std()
-        feats["forecast_h1_seasonal"] = seasonal_idx[fp[:6]].mean()
-        feats["forecast_h2_seasonal"] = seasonal_idx[fp[6:]].mean()
-        pk, tr = int(np.argmax(monthly_means)), int(np.argmin(monthly_means))
-        feats["months_to_peak"] = (pk - origin_pos) % 12
-        feats["months_to_trough"] = (tr - origin_pos) % 12
-        feats["peak_trough_ratio"] = monthly_means[pk] / (monthly_means[tr] + eps)
-        yr1, yr2 = history[-24:-12], history[-12:]
-        c = np.corrcoef(yr1/(yr1.mean()+eps), yr2/(yr2.mean()+eps))[0,1]
-        feats["seasonal_consistency"] = c if not np.isnan(c) else 0.0
-        feats["same_month_yoy_ratio"] = history[-1] / (history[-13] + eps)
-    elif tenure >= 13:
-        feats["same_month_yoy_ratio"] = history[-1] / (history[-13] + eps)
-        for f in ["seasonal_strength","seasonal_range","forecast_seasonal_std","seasonal_consistency"]: feats[f] = 0.0
-        for f in ["forecast_seasonal_load","forecast_h1_seasonal","forecast_h2_seasonal"]: feats[f] = 1.0
-        feats["months_to_peak"]=0; feats["months_to_trough"]=0; feats["peak_trough_ratio"]=1.0
-    else:
-        feats["same_month_yoy_ratio"] = 1.0
-        for f in ["seasonal_strength","seasonal_range","forecast_seasonal_std","seasonal_consistency"]: feats[f] = 0.0
-        for f in ["forecast_seasonal_load","forecast_h1_seasonal","forecast_h2_seasonal"]: feats[f] = 1.0
-        feats["months_to_peak"]=0; feats["months_to_trough"]=0; feats["peak_trough_ratio"]=1.0
-
-    for label, w in [("12m",12),("6m",6),("lifetime",tenure)]:
-        win = _safe_window(history, w); m = win.mean()
-        feats[f"cv_{label}"] = win.std()/(m+eps)
-        feats[f"iqr_{label}"] = np.percentile(win,75)-np.percentile(win,25)
-        feats[f"iqr_pct_{label}"] = feats[f"iqr_{label}"]/(m+eps)
-        feats[f"skew_{label}"] = float(pd.Series(win).skew()) if len(win)>=4 else 0.0
-        feats[f"kurtosis_{label}"] = float(pd.Series(win).kurtosis()) if len(win)>=4 else 0.0
-    r12 = _safe_window(history, 12)
-    feats["mad_12m"] = np.mean(np.abs(r12 - r12.mean()))
-    feats["mad_12m_pct"] = feats["mad_12m"] / (r12.mean() + eps)
-
-    # Outlier, zscore, sparsity, structural break, recency, percentile, gini,
-    # log, autocorrelation, vol change, extreme values — abbreviated for space
-    # but functionally identical to LightGBM pipeline
-    for label, w in [("12m",12),("24m",24)]:
-        win = _safe_window(history, w)
-        if len(win)>=4:
-            q1,q3 = np.percentile(win,25), np.percentile(win,75); iqr=q3-q1; uf=q3+1.5*iqr; lf=q1-1.5*iqr
-            hi,lo = win[win>uf], win[win<lf]
-            feats[f"outlier_high_count_{label}"]=len(hi); feats[f"outlier_low_count_{label}"]=len(lo)
-            feats[f"outlier_total_count_{label}"]=len(hi)+len(lo); feats[f"outlier_frac_{label}"]=(len(hi)+len(lo))/len(win)
-            feats[f"outlier_high_max_pct_{label}"]=hi.max()/(win.mean()+eps) if len(hi)>0 else 0.0
-            feats[f"outlier_low_min_pct_{label}"]=lo.min()/(win.mean()+eps) if len(lo)>0 else 0.0
-            mask=(win>uf)|(win<lf)
-            feats[f"outlier_clustered_{label}"]=int(np.any(np.diff(np.where(mask)[0])==1)) if mask.sum()>=2 else 0
-            feats[f"last_month_is_outlier_{label}"]=int(win[-1]>uf or win[-1]<lf)
-            feats[f"recent3_outlier_count_{label}"]=int(np.sum((win[-min(3,len(win)):]>uf)|(win[-min(3,len(win)):]<lf)))
-        else:
-            for f in [f"outlier_high_count_{label}",f"outlier_low_count_{label}",f"outlier_total_count_{label}",
-                       f"outlier_frac_{label}",f"outlier_high_max_pct_{label}",f"outlier_low_min_pct_{label}",
-                       f"outlier_clustered_{label}",f"last_month_is_outlier_{label}",f"recent3_outlier_count_{label}"]:
-                feats[f]=0.0
-
-    r12 = _safe_window(history,12); med=np.median(r12); mad_v=np.median(np.abs(r12-med))+eps
-    z = (r12-med)/(1.4826*mad_v)
-    feats["zscore_last_month"]=z[-1]; feats["zscore_abs_max_12m"]=np.abs(z).max()
-    feats["months_with_zscore_gt2"]=int(np.sum(np.abs(z)>2))
-    if len(r12)>=4:
-        sv=np.sort(r12); trim=max(1,len(sv)//10); wm=sv[trim:-trim].mean()
-        feats["winsorized_vs_mean_ratio"]=wm/(r12.mean()+eps)
-    else:
-        feats["winsorized_vs_mean_ratio"]=1.0
-
-    for label, w in [("12m",12),("life",tenure)]:
-        win = _safe_window(history, w); nz=int((win==0).sum())
-        feats[f"zero_count_{label}"]=nz; feats[f"zero_frac_{label}"]=nz/len(win)
-    is_zero=(history==0).astype(int); runs=[]; cr=0
-    for v in is_zero:
-        if v: cr+=1
-        else:
-            if cr>0: runs.append(cr)
-            cr=0
-    if cr>0: runs.append(cr)
-    feats["max_consec_zeros"]=max(runs) if runs else 0
-    feats["trailing_zero_count"]=0
-    for v in reversed(history):
-        if v==0: feats["trailing_zero_count"]+=1
-        else: break
-    feats["is_sparse"]=int(feats["zero_frac_12m"]>0.25)
-    nzv=r12[r12>0]
-    feats["mean_nonzero_12m"]=nzv.mean() if len(nzv)>0 else 0.0
-    feats["cv_nonzero_12m"]=nzv.std()/(nzv.mean()+eps) if len(nzv)>0 else 0.0
-
-    if tenure>=12:
-        r=history[-12:]; cd=np.cumsum(r-r.mean())
-        feats["cusum_range_pct_12m"]=(cd.max()-cd.min())/(r.sum()+eps)
-        bsd,bsp=0.0,0
-        for sp in range(3,len(r)-2):
-            d=abs(r[sp:].mean()-r[:sp].mean())/(r.mean()+eps)
-            if d>bsd: bsd,bsp=d,sp
-        feats["regime_change_magnitude_12m"]=bsd
-        feats["regime_change_direction_12m"]=(r[bsp:].mean()-r[:bsp].mean())/(r[:bsp].mean()+eps) if 0<bsp<12 else 0.0
-    else:
-        feats["cusum_range_pct_12m"]=0.0; feats["regime_change_magnitude_12m"]=0.0; feats["regime_change_direction_12m"]=0.0
-    if tenure>=24:
-        feats["regime_shift_24m"]=(history[-12:].mean()-history[-24:-12].mean())/(history[-24:-12].mean()+eps)
-    else:
-        feats["regime_shift_24m"]=0.0
-
-    last_val=history[-1]
-    feats["last_vs_mean_12m"]=last_val/(feats["mean_12m"]+eps)
-    feats["last_vs_lifetime_mean"]=last_val/(feats["lifetime_mean"]+eps)
-
-    r12=_safe_window(history,12)
-    for p in [10,25,50,75,90]:
-        feats[f"pctl_{p}_pct_mean_12m"]=np.percentile(r12,p)/(r12.mean()+eps)
-
-    feats["log_mean_12m"]=np.log1p(max(feats["mean_12m"],0))
-    feats["log_sum_12m"]=np.log1p(max(feats["sum_12m"],0))
-    feats["log_lifetime_mean"]=np.log1p(max(feats["lifetime_mean"],0))
-
-    if tenure>=6:
-        r=_safe_window(history,min(tenure,24)); mr=r.mean(); vr=np.var(r)+eps
-        for lag in [1,2,3,6,12]:
-            feats[f"autocorr_lag{lag}"]=np.mean((r[lag:]-mr)*(r[:-lag]-mr))/vr if len(r)>lag else 0.0
-    else:
-        for lag in [1,2,3,6,12]: feats[f"autocorr_lag{lag}"]=0.0
-
-    if tenure>=12:
-        feats["vol_change_6m"]=(history[-6:].std()-history[-12:-6].std())/(history[-12:-6].std()+eps)
-    else:
-        feats["vol_change_6m"]=0.0
-
-    feats["max_vs_mean_12m"]=r12.max()/(r12.mean()+eps)
-    feats["min_vs_mean_12m"]=r12.min()/(r12.mean()+eps)
-    feats["range_pct_12m"]=(r12.max()-r12.min())/(r12.mean()+eps)
-    feats["months_since_lifetime_max"]=tenure-1-np.argmax(history)
-    feats["months_since_lifetime_min"]=tenure-1-np.argmin(history)
-    feats["lifetime_max_vs_mean"]=history.max()/(history.mean()+eps)
-
-    return feats
-
-
-# =============================================================================
-# 3. DATA BUILDERS
-# =============================================================================
-
+# Override NON_FEATURE_COLS to include segment
 NON_FEATURE_COLS = {"tin", "origin_date", "target", "target_log", "target_residual",
-                    "base_12m", "snaive_forecast", "log_snaive"}
+                    "base_12m", "snaive_forecast", "log_snaive", "segment", "segment_reason"}
 
 
 def get_feature_cols(df):
     return [c for c in df.columns if c not in NON_FEATURE_COLS]
 
 
-def build_training_data(df, min_history_months=12, forecast_horizon=12, max_origins_per_tin=6):
-    all_rows = []
+# =============================================================================
+# 1. SEGMENTATION
+# =============================================================================
+
+def assign_segments(df: pd.DataFrame, train_data: pd.DataFrame = None) -> pd.DataFrame:
+    """
+    Assign each tin to a segment based on its latest behavior.
+    Uses features already computed in train_data or computes from raw df.
+    
+    Returns DataFrame: tin | segment | segment_reason
+    """
+    segments = []
+    
     for tin, grp in df.groupby("tin"):
         grp = grp.sort_values("ds").reset_index(drop=True)
-        cf, dates = grp["y"].values, grp["ds"].values
+        cf = grp["y"].values
         n = len(cf)
-        first_o = min_history_months - 1
-        last_o = n - forecast_horizon - 1
-        if first_o > last_o: continue
-        origins = list(range(first_o, last_o + 1))
-        if max_origins_per_tin and len(origins) > max_origins_per_tin:
-            origins = origins[-max_origins_per_tin:]
-        for oidx in origins:
-            target_raw = cf[oidx+1:oidx+1+forecast_horizon].sum()
-            od = pd.Timestamp(dates[oidx])
-            feats = make_features_for_tin(cf, oidx, od)
-            hist = cf[:oidx+1]
-            base_12m = hist[-min(12, len(hist)):].sum()
-            snaive = base_12m
-            log_actual = np.log1p(max(target_raw, 0))
-            log_sn = np.log1p(max(snaive, 0))
-            feats["tin"] = tin
-            feats["origin_date"] = od
-            feats["target"] = target_raw
-            feats["target_log"] = log_actual
-            feats["base_12m"] = base_12m
-            feats["snaive_forecast"] = snaive
-            feats["log_snaive"] = log_sn
-            feats["target_residual"] = log_actual - log_sn
-            all_rows.append(feats)
-    return pd.DataFrame(all_rows)
-
-
-def build_inference_data(df):
-    all_rows = []
-    for tin, grp in df.groupby("tin"):
-        grp = grp.sort_values("ds").reset_index(drop=True)
-        cf, dates = grp["y"].values, grp["ds"].values
-        oidx = len(cf) - 1
-        od = pd.Timestamp(dates[oidx])
-        feats = make_features_for_tin(cf, oidx, od)
-        base_12m = cf[-min(12,len(cf)):].sum()
-        feats["tin"] = tin
-        feats["origin_date"] = od
-        feats["base_12m"] = base_12m
-        feats["snaive_forecast"] = base_12m
-        feats["log_snaive"] = np.log1p(max(base_12m, 0))
-        all_rows.append(feats)
-    return pd.DataFrame(all_rows)
+        
+        # Use last 12 months (or all if shorter)
+        r12 = cf[-min(12, n):]
+        mean_12 = r12.mean()
+        std_12 = r12.std()
+        cv_12 = std_12 / (mean_12 + 1e-9)
+        
+        # Trend: normalized slope over last 12+ months
+        lookback = min(n, 24)
+        seg = cf[-lookback:]
+        x = np.arange(lookback, dtype=float)
+        slope_norm = 0.0
+        if lookback > 2:
+            slope_norm = np.polyfit(x, seg, 1)[0] / (seg.mean() + 1e-9)
+        
+        # Sparsity
+        zero_frac = (r12 == 0).mean()
+        
+        # Regime change: compare last 6m mean to prior 6m mean
+        regime_shift = 0.0
+        if n >= 12:
+            m1 = cf[-12:-6].mean()
+            m2 = cf[-6:].mean()
+            regime_shift = abs(m2 - m1) / (m1 + 1e-9)
+        
+        # Assign segment (order matters — check most specific first)
+        if zero_frac > 0.25:
+            seg_name = "sparse"
+            reason = f"zero_frac={zero_frac:.2f}"
+        elif regime_shift > 0.40:
+            seg_name = "regime_change"
+            reason = f"shift={regime_shift:.2f}"
+        elif slope_norm > 0.015:
+            seg_name = "trending_up"
+            reason = f"slope_norm={slope_norm:.4f}"
+        elif slope_norm < -0.015:
+            seg_name = "trending_down"
+            reason = f"slope_norm={slope_norm:.4f}"
+        elif cv_12 > 0.30:
+            seg_name = "volatile"
+            reason = f"cv={cv_12:.2f}"
+        else:
+            seg_name = "stable"
+            reason = f"cv={cv_12:.2f}, slope={slope_norm:.4f}"
+        
+        segments.append({"tin": tin, "segment": seg_name, "segment_reason": reason})
+    
+    return pd.DataFrame(segments)
 
 
 # =============================================================================
-# 4. FEATURE SELECTION (correlation + variance filter — no LightGBM needed)
+# 2. TRAIN ONE MODEL PER SEGMENT
 # =============================================================================
 
-def select_features_linear(train_data, corr_threshold=0.90, max_features=50):
+def train_segment_model(
+    train_data: pd.DataFrame,
+    segment_name: str,
+    model_type: str = "lasso",
+    alpha: float = 0.01,
+    corr_threshold: float = 0.90,
+    max_features: int = 30,
+) -> dict:
     """
-    Feature selection tuned for linear regression:
-      1. Remove near-zero variance
-      2. Remove features highly correlated with each other (keep higher corr with target)
-      3. Keep top N by absolute correlation with target_residual
+    Train a linear model for one segment.
+    Returns dict with model, scaler, selected_features, coefficients.
     """
+    n_rows = len(train_data)
+    n_tins = train_data["tin"].nunique()
+    
+    # If segment is too small, return a "naive-only" model (no correction)
+    if n_rows < 20 or n_tins < 5:
+        print(f"    [{segment_name}] Too small ({n_rows} rows, {n_tins} tins) → using naive only")
+        return {"model": None, "scaler": None, "selected_features": [], "type": "naive_only"}
+    
+    # Feature selection
     feat_cols = get_feature_cols(train_data)
     target = train_data["target_residual"]
-
-    # Step 1: Remove near-zero variance
-    remaining = []
-    for c in feat_cols:
-        if train_data[c].dtype in ("object", "str"): continue
-        if train_data[c].std() > 1e-10:
-            remaining.append(c)
-    print(f"  After near-zero-variance: {len(remaining)} (dropped {len(feat_cols)-len(remaining)})")
-
-    # Step 2: Correlation with target
-    target_corr = {}
-    for c in remaining:
-        r = train_data[c].corr(target)
-        target_corr[c] = abs(r) if not np.isnan(r) else 0.0
-
-    # Step 3: Remove inter-feature correlation (keep higher target-corr)
-    corr_matrix = train_data[remaining].corr().abs()
-    drop_corr = set()
-    upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape, dtype=bool), k=1))
-    for col in upper.columns:
-        for row in upper.index:
-            if upper.loc[row, col] > corr_threshold:
-                drop_corr.add(row if target_corr.get(row, 0) < target_corr.get(col, 0) else col)
-    remaining = [f for f in remaining if f not in drop_corr]
-    print(f"  After correlation removal (>{corr_threshold}): {len(remaining)} (dropped {len(drop_corr)})")
-
-    # Step 4: Keep top N by target correlation
+    
+    # Quick variance + correlation filter
+    remaining = [c for c in feat_cols if train_data[c].std() > 1e-10]
+    target_corr = {c: abs(train_data[c].corr(target)) for c in remaining}
+    target_corr = {k: v for k, v in target_corr.items() if not np.isnan(v)}
+    
+    # Correlation removal
+    if len(remaining) > 5:
+        corr_matrix = train_data[remaining].corr().abs()
+        drop_corr = set()
+        upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape, dtype=bool), k=1))
+        for col in upper.columns:
+            for row in upper.index:
+                if upper.loc[row, col] > corr_threshold:
+                    drop_corr.add(row if target_corr.get(row, 0) < target_corr.get(col, 0) else col)
+        remaining = [f for f in remaining if f not in drop_corr]
+    
+    # Top N by target correlation
     remaining = sorted(remaining, key=lambda f: target_corr.get(f, 0), reverse=True)
-    if len(remaining) > max_features:
-        remaining = remaining[:max_features]
-    print(f"  After top-{max_features} filter: {len(remaining)}")
-
-    # Report
-    report = []
-    for f in remaining:
-        report.append({"feature": f, "target_corr": target_corr.get(f, 0)})
-    report_df = pd.DataFrame(report).sort_values("target_corr", ascending=False).reset_index(drop=True)
-    print(f"\n  Top 10 features by |correlation with residual|:")
-    for _, r in report_df.head(10).iterrows():
-        print(f"    {r['feature']:40s} corr={r['target_corr']:.4f}")
-
-    return remaining, report_df
+    remaining = remaining[:min(max_features, len(remaining))]
+    
+    if len(remaining) == 0:
+        print(f"    [{segment_name}] No features passed selection → using naive only")
+        return {"model": None, "scaler": None, "selected_features": [], "type": "naive_only"}
+    
+    # Train
+    X = train_data[remaining].values
+    y = train_data["target_residual"].values
+    
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+    X_scaled = np.nan_to_num(X_scaled, nan=0.0, posinf=0.0, neginf=0.0)
+    
+    if model_type == "lasso":
+        model = Lasso(alpha=alpha, fit_intercept=True, max_iter=5000)
+    else:
+        model = Ridge(alpha=alpha, fit_intercept=True)
+    
+    model.fit(X_scaled, y)
+    
+    train_pred = model.predict(X_scaled)
+    train_mae = np.mean(np.abs(y - train_pred))
+    naive_mae = np.mean(np.abs(y))  # MAE if we predicted 0 residual (pure naive)
+    
+    nonzero = np.sum(np.abs(model.coef_) > 1e-6)
+    
+    # Coefficient table
+    coef_df = pd.DataFrame({
+        "feature": remaining,
+        "coefficient": model.coef_,
+    }).sort_values("coefficient", key=abs, ascending=False)
+    
+    top_feats = coef_df[coef_df["coefficient"].abs() > 1e-6].head(5)
+    feat_str = ", ".join(f"{r['feature']}({r['coefficient']:+.4f})" for _, r in top_feats.iterrows())
+    
+    print(f"    [{segment_name}] {n_rows} rows, {n_tins} tins | "
+          f"{len(remaining)} features → {nonzero} nonzero | "
+          f"MAE: naive={naive_mae:.4f}, model={train_mae:.4f} | "
+          f"top: {feat_str}")
+    
+    return {
+        "model": model,
+        "scaler": scaler,
+        "selected_features": remaining,
+        "coefficients": coef_df,
+        "type": "linear",
+        "train_mae": train_mae,
+        "naive_mae": naive_mae,
+    }
 
 
 # =============================================================================
-# 5. PIPELINE
+# 3. SEGMENTED PIPELINE
 # =============================================================================
 
-def run_pipeline(
+def run_segmented_pipeline(
     df: pd.DataFrame,
     min_history_months: int = 12,
     max_origins_per_tin: Optional[int] = 6,
-    model_type: str = "ridge",
-    alpha: float = 1.0,
+    model_type: str = "lasso",
+    alpha: float = 0.01,
     corr_threshold: float = 0.90,
-    max_features: int = 50,
+    max_features: int = 30,
     output_dir: Optional[str] = None,
 ) -> pd.DataFrame:
     """
-    Linear regression pipeline: seasonal naive + feature correction.
+    Segmented pipeline: one linear model per segment.
     
-    Model (in log space):
-        log(forecast) = log(snaive) + α₁×feat₁ + α₂×feat₂ + ... + intercept
-    
-    Parameters
-    ----------
-    df : [tin, ds, y]
-    model_type : 'ridge', 'lasso', or 'elasticnet'
-    alpha : regularization strength (higher = more shrinkage toward naive)
-    corr_threshold : inter-feature correlation threshold for selection
-    max_features : max features to keep
-    
-    Returns: DataFrame [tin, origin_date, snaive_12m, lr_correction, forecast_12m_sum]
+    Returns: DataFrame [tin, origin_date, segment, snaive_12m, correction, forecast_12m_sum]
     """
     def _save(obj, fn):
         if output_dir is None: return
@@ -478,119 +242,116 @@ def run_pipeline(
 
     if output_dir: print(f"  Artifacts: {output_dir}/\n")
 
-    # Step 1: Prepare
+    # ── Step 1: Prepare ──
     print("=" * 60 + "\nSTEP 1: Preparing data\n" + "=" * 60)
     df = prepare_data(df)
     df = fill_missing_months(df)
     print(f"  {df['tin'].nunique()} tins, {len(df)} rows")
     _save(df, "01_prepared_data.pkl")
 
-    # Step 2: Training rows
-    print("\n" + "=" * 60 + "\nSTEP 2: Building training rows\n" + "=" * 60)
-    train_data = build_training_data(df, min_history_months=min_history_months, max_origins_per_tin=max_origins_per_tin)
-    res = train_data["target_residual"]
-    print(f"  {len(train_data)} rows, {train_data['tin'].nunique()} tins")
-    print(f"  target_residual — min: {res.min():.3f}, median: {res.median():.3f}, max: {res.max():.3f}")
-    _save(train_data, "02_train_data.pkl")
+    # ── Step 2: Segment assignment ──
+    print("\n" + "=" * 60 + "\nSTEP 2: Segmenting tins\n" + "=" * 60)
+    seg_df = assign_segments(df)
+    seg_counts = seg_df["segment"].value_counts()
+    print(f"  Segments:")
+    for seg, cnt in seg_counts.items():
+        print(f"    {seg:20s} {cnt:6d} tins ({cnt/len(seg_df)*100:.1f}%)")
+    _save(seg_df, "02_segments.pkl")
 
-    # Step 3: Feature selection
-    print("\n" + "=" * 60 + "\nSTEP 3: Feature Selection (for linear model)\n" + "=" * 60)
-    selected_features, selection_report = select_features_linear(
-        train_data, corr_threshold=corr_threshold, max_features=max_features)
-    _save(selected_features, "03_selected_features.pkl")
-    _save(selection_report, "03b_selection_report.pkl")
+    # ── Step 3: Build training data ──
+    print("\n" + "=" * 60 + "\nSTEP 3: Building training rows\n" + "=" * 60)
+    train_data = build_training_data(df, min_history_months=min_history_months,
+                                      max_origins_per_tin=max_origins_per_tin)
+    train_data = train_data.merge(seg_df[["tin", "segment"]], on="tin", how="left")
+    print(f"  {len(train_data)} total training rows")
+    _save(train_data, "03_train_data.pkl")
 
-    # Step 4: Train linear model
-    print("\n" + "=" * 60 + f"\nSTEP 4: Training {model_type} regression ({len(selected_features)} features)\n" + "=" * 60)
+    # ── Step 4: Train one model per segment ──
+    print("\n" + "=" * 60 + "\nSTEP 4: Training models per segment\n" + "=" * 60)
+    segment_models = {}
+    for seg_name in seg_counts.index:
+        seg_train = train_data[train_data["segment"] == seg_name]
+        segment_models[seg_name] = train_segment_model(
+            seg_train, seg_name,
+            model_type=model_type, alpha=alpha,
+            corr_threshold=corr_threshold, max_features=max_features,
+        )
+    _save(segment_models, "04_segment_models.pkl")
 
-    X_train = train_data[selected_features].values
-    y_train = train_data["target_residual"].values
-
-    # Standardize features (important for linear regression)
-    scaler = StandardScaler()
-    X_train_scaled = scaler.fit_transform(X_train)
-
-    # Handle NaN/Inf in features
-    X_train_scaled = np.nan_to_num(X_train_scaled, nan=0.0, posinf=0.0, neginf=0.0)
-
-    if model_type == "ridge":
-        model = Ridge(alpha=alpha, fit_intercept=True)
-    elif model_type == "lasso":
-        model = Lasso(alpha=alpha, fit_intercept=True, max_iter=5000)
-    elif model_type == "elasticnet":
-        model = ElasticNet(alpha=alpha, l1_ratio=0.5, fit_intercept=True, max_iter=5000)
-    else:
-        raise ValueError(f"Unknown model_type: {model_type}")
-
-    model.fit(X_train_scaled, y_train)
-
-    # Training diagnostics
-    train_pred = model.predict(X_train_scaled)
-    train_mae = np.mean(np.abs(y_train - train_pred))
-    print(f"  Train MAE on residual: {train_mae:.4f}")
-    print(f"  Intercept: {model.intercept_:.4f}")
-
-    # Show coefficients
-    coef_df = pd.DataFrame({
-        "feature": selected_features,
-        "coefficient": model.coef_,
-        "abs_coef": np.abs(model.coef_),
-    }).sort_values("abs_coef", ascending=False)
-
-    nonzero = (coef_df["abs_coef"] > 1e-6).sum()
-    print(f"  Nonzero coefficients: {nonzero} out of {len(selected_features)}")
-    print(f"\n  Top 15 coefficients:")
-    for _, r in coef_df.head(15).iterrows():
-        direction = "+" if r["coefficient"] > 0 else "-"
-        print(f"    {r['feature']:40s} {direction}{r['abs_coef']:.4f}")
-
-    _save(model, "04_model.pkl")
-    _save(scaler, "04b_scaler.pkl")
-    _save(coef_df, "05_coefficients.pkl")
-
-    # Step 5: Forecast
-    print("\n" + "=" * 60 + "\nSTEP 5: Forecasting (seasonal naive + linear correction)\n" + "=" * 60)
+    # ── Step 5: Build inference data ──
+    print("\n" + "=" * 60 + "\nSTEP 5: Forecasting per segment\n" + "=" * 60)
     inf = build_inference_data(df)
+    inf = inf.merge(seg_df[["tin", "segment"]], on="tin", how="left")
 
-    X_inf = inf[selected_features].values
-    X_inf_scaled = scaler.transform(X_inf)
-    X_inf_scaled = np.nan_to_num(X_inf_scaled, nan=0.0, posinf=0.0, neginf=0.0)
+    # Predict per segment
+    all_corrections = np.zeros(len(inf))
+    
+    for seg_name, seg_model_info in segment_models.items():
+        mask = (inf["segment"] == seg_name).values
+        n_seg = mask.sum()
+        
+        if n_seg == 0:
+            continue
+        
+        if seg_model_info["type"] == "naive_only":
+            # No correction — forecast = seasonal naive
+            all_corrections[mask] = 0.0
+            print(f"    [{seg_name:20s}] {n_seg:5d} tins → naive only (correction = 0)")
+        else:
+            model = seg_model_info["model"]
+            scaler = seg_model_info["scaler"]
+            feats = seg_model_info["selected_features"]
+            
+            X_seg = inf.loc[mask, feats].values
+            X_seg_scaled = scaler.transform(X_seg)
+            X_seg_scaled = np.nan_to_num(X_seg_scaled, nan=0.0, posinf=0.0, neginf=0.0)
+            
+            pred = model.predict(X_seg_scaled)
+            all_corrections[mask] = pred
+            
+            print(f"    [{seg_name:20s}] {n_seg:5d} tins → correction: "
+                  f"min={pred.min():+.4f}, median={np.median(pred):+.4f}, max={pred.max():+.4f}")
 
-    pred_residual = model.predict(X_inf_scaled)
-
-    # Combine: forecast = expm1( log1p(snaive) + predicted_residual )
+    # Combine: forecast = expm1(log1p(snaive) + correction)
     log_snaive = inf["log_snaive"].values
-    log_forecast = log_snaive + pred_residual
+    log_forecast = log_snaive + all_corrections
     forecast_12m = np.expm1(log_forecast)
     forecast_12m = np.maximum(forecast_12m, 0)
 
-    inf["lr_correction"] = pred_residual
+    inf["correction"] = all_corrections
     inf["forecast_12m_sum"] = forecast_12m
-    forecasts = inf[["tin", "origin_date", "snaive_forecast", "lr_correction", "forecast_12m_sum"]].copy()
+
+    forecasts = inf[["tin", "origin_date", "segment", "snaive_forecast",
+                      "correction", "forecast_12m_sum"]].copy()
     forecasts = forecasts.rename(columns={"snaive_forecast": "snaive_12m"})
 
-    print(f"  {len(forecasts)} tins")
-    print(f"  seasonal naive — min: {inf['snaive_forecast'].min():,.0f}, "
-          f"median: {inf['snaive_forecast'].median():,.0f}, max: {inf['snaive_forecast'].max():,.0f}")
-    print(f"  LR correction  — min: {pred_residual.min():.4f}, "
-          f"median: {np.median(pred_residual):.4f}, max: {pred_residual.max():.4f}")
-    print(f"  final forecast — min: {forecast_12m.min():,.0f}, "
-          f"median: {np.median(forecast_12m):,.0f}, max: {forecast_12m.max():,.0f}")
-
+    # ── Summary ──
+    print("\n" + "=" * 60 + "\nSUMMARY\n" + "=" * 60)
+    print(f"  Total tins: {len(forecasts)}")
+    print(f"  Forecast range: {forecast_12m.min():,.0f} to {forecast_12m.max():,.0f}")
+    
     pct_adj = (forecast_12m - inf["snaive_forecast"].values) / (inf["snaive_forecast"].values + 1e-9) * 100
-    print(f"  LR adjustment  — median: {np.median(pct_adj):+.1f}%, "
-          f"P10: {np.percentile(pct_adj,10):+.1f}%, P90: {np.percentile(pct_adj,90):+.1f}%")
+    
+    print(f"\n  Adjustment vs naive by segment:")
+    print(f"  {'Segment':20s} {'Count':>6s} {'Median Adj':>12s} {'P10':>10s} {'P90':>10s}")
+    print(f"  {'-'*20} {'-'*6} {'-'*12} {'-'*10} {'-'*10}")
+    for seg_name in seg_counts.index:
+        mask = forecasts["segment"] == seg_name
+        if mask.sum() == 0: continue
+        seg_pct = pct_adj[mask.values]
+        print(f"  {seg_name:20s} {mask.sum():6d} {np.median(seg_pct):+11.1f}% "
+              f"{np.percentile(seg_pct,10):+9.1f}% {np.percentile(seg_pct,90):+9.1f}%")
+    
+    overall_adj = np.median(pct_adj)
+    print(f"\n  Overall: median adjustment = {overall_adj:+.1f}%")
 
-    _save(inf, "06_inference_features.pkl")
-    _save(forecasts, "07_forecasts.pkl")
+    _save(forecasts, "05_forecasts.pkl")
 
     if output_dir: print(f"\n  All saved to: {output_dir}/")
 
-    run_pipeline.last_results = {
-        "model": model, "scaler": scaler,
-        "selected_features": selected_features,
-        "coefficients": coef_df,
-        "selection_report": selection_report,
+    run_segmented_pipeline.last_results = {
+        "segment_models": segment_models,
+        "segment_assignments": seg_df,
         "inference_features": inf,
     }
     return forecasts
