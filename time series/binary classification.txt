@@ -1,0 +1,709 @@
+"""
+Seasonal Naive Error Classification — Step by Step
+====================================================
+Run each section as a separate Jupyter notebook cell.
+You can restart from any step by loading the saved pickle files.
+
+Goal: 
+  1. For each tin, compute how wrong seasonal naive WAS (using historical data)
+  2. Classify tins into: naive_overestimate / naive_underestimate / naive_accurate
+  3. Train a correction model per class
+  4. At inference: classify → correct → forecast
+"""
+
+
+# =============================================================================
+# CELL 1: Imports and setup
+# =============================================================================
+
+import numpy as np
+import pandas as pd
+import lightgbm as lgb
+from sklearn.linear_model import Lasso, Ridge
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import classification_report, confusion_matrix
+import pickle, os, warnings
+warnings.filterwarnings("ignore")
+
+OUTPUT_DIR = "./classification_output"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+def save(obj, name):
+    path = os.path.join(OUTPUT_DIR, f"{name}.pkl")
+    with open(path, "wb") as f:
+        pickle.dump(obj, f, protocol=pickle.HIGHEST_PROTOCOL)
+    print(f"  Saved: {path}")
+
+def load(name):
+    path = os.path.join(OUTPUT_DIR, f"{name}.pkl")
+    with open(path, "rb") as f:
+        return pickle.load(f)
+
+
+# =============================================================================
+# CELL 2: Load and prepare data
+# =============================================================================
+
+# ── Replace with your actual data ──
+df = pd.read_csv("your_data.csv")  # columns: tin, ds, y
+
+df["ds"] = pd.to_datetime(df["ds"])
+df["ds"] = df["ds"].dt.to_period("M").dt.to_timestamp()
+df = df.sort_values(["tin", "ds"]).drop_duplicates(subset=["tin", "ds"], keep="last").reset_index(drop=True)
+
+# Fill missing months with 0
+records = []
+for tin, grp in df.groupby("tin"):
+    grp = grp.set_index("ds").sort_index()
+    full_range = pd.date_range(grp.index.min(), grp.index.max(), freq="MS")
+    grp = grp.reindex(full_range, fill_value=0)
+    grp["tin"] = tin
+    grp.index.name = "ds"
+    records.append(grp.reset_index())
+df = pd.concat(records, ignore_index=True)
+
+print(f"Tins: {df['tin'].nunique()}, Rows: {len(df)}")
+print(f"Date range: {df['ds'].min().date()} to {df['ds'].max().date()}")
+save(df, "01_prepared_data")
+
+
+# =============================================================================
+# CELL 3: Feature engineering function
+# =============================================================================
+
+def _safe_window(history, w):
+    return history[-w:] if len(history) >= w else history
+
+def make_features(cashflows, origin_idx, origin_date):
+    """Compute all features for one tin at one origin point."""
+    history = cashflows[:origin_idx + 1].astype(float)
+    tenure = len(history)
+    eps = 1e-9
+    f = {}
+
+    # Tenure
+    f["tenure"] = tenure
+    f["tenure_bucket"] = min(tenure // 6, 8)
+    f["tenure_log"] = np.log1p(tenure)
+
+    # Trailing aggregates
+    for w in [1, 2, 3, 6, 9, 12, 18, 24]:
+        win = _safe_window(history, w)
+        f[f"sum_{w}m"] = win.sum()
+        f[f"mean_{w}m"] = win.mean()
+        f[f"std_{w}m"] = win.std()
+        f[f"min_{w}m"] = win.min()
+        f[f"max_{w}m"] = win.max()
+        f[f"median_{w}m"] = np.median(win)
+        f[f"has_{w}m"] = int(tenure >= w)
+        f[f"range_pct_{w}m"] = (win.max() - win.min()) / (win.mean() + eps)
+
+    f["annualized_rate"] = history.mean() * 12
+    f["lifetime_sum"] = history.sum()
+    f["lifetime_mean"] = history.mean()
+    f["lifetime_std"] = history.std()
+    f["lifetime_median"] = np.median(history)
+
+    # Ratios
+    f["ratio_1m_3m"] = f["sum_1m"] / (f["sum_3m"] + eps)
+    f["ratio_1m_6m"] = f["sum_1m"] / (f["sum_6m"] + eps)
+    f["ratio_1m_12m"] = f["sum_1m"] / (f["sum_12m"] + eps)
+    f["ratio_3m_6m"] = f["sum_3m"] / (f["sum_6m"] + eps)
+    f["ratio_3m_12m"] = f["sum_3m"] / (f["sum_12m"] + eps)
+    f["ratio_6m_12m"] = f["sum_6m"] / (f["sum_12m"] + eps)
+    f["ratio_6m_24m"] = f["sum_6m"] / (f["sum_24m"] + eps)
+    f["ratio_12m_24m"] = f["sum_12m"] / (f["sum_24m"] + eps)
+    f["ratio_recent_to_lifetime"] = _safe_window(history, 3).mean() / (history.mean() + eps)
+    f["mean_ratio_3m_12m"] = f["mean_3m"] / (f["mean_12m"] + eps)
+    f["mean_ratio_6m_12m"] = f["mean_6m"] / (f["mean_12m"] + eps)
+    f["mean_ratio_1m_6m"] = f["mean_1m"] / (f["mean_6m"] + eps)
+
+    # YoY
+    if tenure >= 24:
+        prev = history[-24:-12].sum()
+        f["yoy_growth"] = (f["sum_12m"] - prev) / (prev + eps)
+        f["prev_12m_sum"] = prev
+        f["prev_12m_mean"] = history[-24:-12].mean()
+        f["yoy_mean_growth"] = (f["mean_12m"] - f["prev_12m_mean"]) / (f["prev_12m_mean"] + eps)
+    else:
+        f["yoy_growth"] = 0.0; f["prev_12m_sum"] = f["sum_12m"]
+        f["prev_12m_mean"] = f["mean_12m"]; f["yoy_mean_growth"] = 0.0
+    if tenure >= 36:
+        pp = history[-36:-24].sum()
+        f["yoy_growth_2y_ago"] = (history[-24:-12].sum() - pp) / (pp + eps)
+        f["yoy_acceleration"] = f["yoy_growth"] - f["yoy_growth_2y_ago"]
+    else:
+        f["yoy_growth_2y_ago"] = 0.0; f["yoy_acceleration"] = 0.0
+    f["same_month_yoy"] = history[-1] / (history[-13] + eps) if tenure >= 13 else 1.0
+
+    # Trend
+    for label, lb in [("full", min(tenure, 24)), ("12m", min(tenure, 12)),
+                       ("6m", min(tenure, 6)), ("3m", min(tenure, 3))]:
+        seg = history[-lb:]; x = np.arange(lb, dtype=float)
+        if lb > 2:
+            c = np.polyfit(x, seg, 1)
+            f[f"slope_{label}"] = c[0]
+            f[f"slope_{label}_norm"] = c[0] / (seg.mean() + eps)
+            pred = np.polyval(c, x)
+            ss_res = np.sum((seg - pred) ** 2); ss_tot = np.sum((seg - seg.mean()) ** 2)
+            f[f"r2_{label}"] = 1 - ss_res / (ss_tot + eps)
+        else:
+            f[f"slope_{label}"] = 0.0; f[f"slope_{label}_norm"] = 0.0; f[f"r2_{label}"] = 0.0
+
+    f["momentum_6m"] = (history[-6:].mean() - history[-12:-6].mean()) / (history[-12:-6].mean() + eps) if tenure >= 12 else 0.0
+    f["momentum_12m"] = (history[-12:].mean() - history[-24:-12].mean()) / (history[-24:-12].mean() + eps) if tenure >= 24 else 0.0
+    if tenure >= 12:
+        h1, h2 = history[-12:-6], history[-6:]
+        s1 = np.polyfit(np.arange(len(h1), dtype=float), h1, 1)[0] if len(h1) > 2 else 0.0
+        s2 = np.polyfit(np.arange(len(h2), dtype=float), h2, 1)[0] if len(h2) > 2 else 0.0
+        f["slope_acceleration"] = s2 - s1
+        f["slope_acceleration_norm"] = (s2 - s1) / (history[-12:].mean() + eps)
+    else:
+        f["slope_acceleration"] = 0.0; f["slope_acceleration_norm"] = 0.0
+
+    # Diff / Change
+    if tenure >= 3:
+        diffs = np.diff(history[-min(13, tenure):]); ad = np.abs(diffs)
+        shifted = history[-min(13, tenure):-1]; pc = diffs / (np.abs(shifted) + eps)
+        f["mean_diff"]=diffs.mean(); f["std_diff"]=diffs.std(); f["last_diff"]=diffs[-1]
+        f["mean_abs_diff"]=ad.mean(); f["max_abs_diff"]=ad.max(); f["median_abs_diff"]=np.median(ad)
+        f["mean_pct_change"]=pc.mean(); f["std_pct_change"]=pc.std()
+        f["max_pct_change"]=pc.max(); f["min_pct_change"]=pc.min()
+        f["last_pct_change"]=pc[-1]; f["median_pct_change"]=np.median(pc)
+        f["pct_months_positive"]=(diffs>0).mean(); f["pct_months_negative"]=(diffs<0).mean()
+        f["pct_months_flat"]=(diffs==0).mean()
+    else:
+        for k in ["mean_diff","std_diff","last_diff","mean_abs_diff","max_abs_diff","median_abs_diff",
+                   "mean_pct_change","std_pct_change","max_pct_change","min_pct_change",
+                   "last_pct_change","median_pct_change","pct_months_positive","pct_months_negative","pct_months_flat"]:
+            f[k] = 0.0
+
+    # Seasonality
+    om = origin_date.month
+    f["origin_month_sin"] = np.sin(2 * np.pi * om / 12)
+    f["origin_month_cos"] = np.cos(2 * np.pi * om / 12)
+    f["origin_month"] = om
+    f["origin_quarter"] = (om - 1) // 3
+    if tenure >= 24:
+        l24 = history[-24:]
+        mm = np.array([l24[i::12].mean() for i in range(12)])
+        om_ = mm.mean(); si = mm / (om_ + eps)
+        f["seasonal_strength"] = mm.std() / (om_ + eps)
+        f["seasonal_range"] = (mm.max() - mm.min()) / (om_ + eps)
+        op = om - 1; fp = [(op + i) % 12 for i in range(1, 13)]
+        f["forecast_seasonal_load"] = si[fp].mean()
+        f["forecast_seasonal_std"] = si[fp].std()
+        f["forecast_h1_seasonal"] = si[fp[:6]].mean()
+        f["forecast_h2_seasonal"] = si[fp[6:]].mean()
+        pk, tr = int(np.argmax(mm)), int(np.argmin(mm))
+        f["months_to_peak"] = (pk - op) % 12; f["months_to_trough"] = (tr - op) % 12
+        f["peak_trough_ratio"] = mm[pk] / (mm[tr] + eps)
+        yr1, yr2 = history[-24:-12], history[-12:]
+        c = np.corrcoef(yr1/(yr1.mean()+eps), yr2/(yr2.mean()+eps))[0,1]
+        f["seasonal_consistency"] = c if not np.isnan(c) else 0.0
+        f["same_month_yoy_ratio"] = history[-1] / (history[-13] + eps)
+    elif tenure >= 13:
+        f["same_month_yoy_ratio"] = history[-1] / (history[-13] + eps)
+        for k in ["seasonal_strength","seasonal_range","forecast_seasonal_std","seasonal_consistency"]: f[k]=0.0
+        for k in ["forecast_seasonal_load","forecast_h1_seasonal","forecast_h2_seasonal"]: f[k]=1.0
+        f["months_to_peak"]=0; f["months_to_trough"]=0; f["peak_trough_ratio"]=1.0
+    else:
+        f["same_month_yoy_ratio"]=1.0
+        for k in ["seasonal_strength","seasonal_range","forecast_seasonal_std","seasonal_consistency"]: f[k]=0.0
+        for k in ["forecast_seasonal_load","forecast_h1_seasonal","forecast_h2_seasonal"]: f[k]=1.0
+        f["months_to_peak"]=0; f["months_to_trough"]=0; f["peak_trough_ratio"]=1.0
+
+    # Volatility / Shape
+    for label, w in [("12m",12),("6m",6),("lifetime",tenure)]:
+        win = _safe_window(history, w); m = win.mean()
+        f[f"cv_{label}"] = win.std()/(m+eps)
+        f[f"iqr_{label}"] = np.percentile(win,75)-np.percentile(win,25)
+        f[f"iqr_pct_{label}"] = f[f"iqr_{label}"]/(m+eps)
+        f[f"skew_{label}"] = float(pd.Series(win).skew()) if len(win)>=4 else 0.0
+        f[f"kurtosis_{label}"] = float(pd.Series(win).kurtosis()) if len(win)>=4 else 0.0
+    r12 = _safe_window(history, 12)
+    f["mad_12m"] = np.mean(np.abs(r12-r12.mean()))
+    f["mad_12m_pct"] = f["mad_12m"]/(r12.mean()+eps)
+
+    # Outliers
+    for label, w in [("12m",12),("24m",24)]:
+        win = _safe_window(history, w)
+        if len(win)>=4:
+            q1,q3=np.percentile(win,25),np.percentile(win,75); iqr=q3-q1
+            uf,lf=q3+1.5*iqr,q1-1.5*iqr; hi,lo=win[win>uf],win[win<lf]
+            f[f"outlier_high_count_{label}"]=len(hi); f[f"outlier_low_count_{label}"]=len(lo)
+            f[f"outlier_total_count_{label}"]=len(hi)+len(lo)
+            f[f"outlier_frac_{label}"]=(len(hi)+len(lo))/len(win)
+            f[f"outlier_high_max_pct_{label}"]=hi.max()/(win.mean()+eps) if len(hi)>0 else 0.0
+            f[f"outlier_low_min_pct_{label}"]=lo.min()/(win.mean()+eps) if len(lo)>0 else 0.0
+            mask=(win>uf)|(win<lf)
+            f[f"outlier_clustered_{label}"]=int(np.any(np.diff(np.where(mask)[0])==1)) if mask.sum()>=2 else 0
+            f[f"last_month_is_outlier_{label}"]=int(win[-1]>uf or win[-1]<lf)
+            f[f"recent3_outlier_count_{label}"]=int(np.sum((win[-min(3,len(win)):]>uf)|(win[-min(3,len(win)):]<lf)))
+        else:
+            for k in [f"outlier_high_count_{label}",f"outlier_low_count_{label}",f"outlier_total_count_{label}",
+                       f"outlier_frac_{label}",f"outlier_high_max_pct_{label}",f"outlier_low_min_pct_{label}",
+                       f"outlier_clustered_{label}",f"last_month_is_outlier_{label}",f"recent3_outlier_count_{label}"]:
+                f[k]=0.0
+
+    # Z-score
+    med=np.median(r12); mad_v=np.median(np.abs(r12-med))+eps; z=(r12-med)/(1.4826*mad_v)
+    f["zscore_last_month"]=z[-1]; f["zscore_abs_max_12m"]=np.abs(z).max()
+    f["months_with_zscore_gt2"]=int(np.sum(np.abs(z)>2))
+    if len(r12)>=4:
+        sv=np.sort(r12); trim=max(1,len(sv)//10); wm=sv[trim:-trim].mean()
+        f["winsorized_vs_mean_ratio"]=wm/(r12.mean()+eps)
+    else:
+        f["winsorized_vs_mean_ratio"]=1.0
+
+    # Sparsity
+    for label, w in [("12m",12),("24m",24),("life",tenure)]:
+        win = _safe_window(history, w); nz=int((win==0).sum())
+        f[f"zero_count_{label}"]=nz; f[f"zero_frac_{label}"]=nz/len(win)
+    is_z=(history==0).astype(int); runs=[]; cr=0
+    for v in is_z:
+        if v: cr+=1
+        else:
+            if cr>0: runs.append(cr)
+            cr=0
+    if cr>0: runs.append(cr)
+    f["max_consec_zeros"]=max(runs) if runs else 0
+    f["num_zero_runs"]=len(runs)
+    tz=0
+    for v in reversed(history):
+        if v==0: tz+=1
+        else: break
+    f["trailing_zero_count"]=tz; f["trailing_zero_frac"]=tz/tenure
+    f["is_sparse"]=int(f["zero_frac_12m"]>0.25)
+    nzv=r12[r12>0]
+    f["mean_nonzero_12m"]=nzv.mean() if len(nzv)>0 else 0.0
+    f["cv_nonzero_12m"]=nzv.std()/(nzv.mean()+eps) if len(nzv)>0 else 0.0
+    f["count_nonzero_12m"]=len(nzv)
+
+    # Structural break
+    if tenure>=12:
+        r=history[-12:]; cd=np.cumsum(r-r.mean())
+        f["cusum_range_pct_12m"]=(cd.max()-cd.min())/(r.sum()+eps)
+        bsd,bsp=0.0,0
+        for sp in range(3,len(r)-2):
+            d=abs(r[sp:].mean()-r[:sp].mean())/(r.mean()+eps)
+            if d>bsd: bsd,bsp=d,sp
+        f["regime_change_magnitude_12m"]=bsd
+        f["regime_change_direction_12m"]=(r[bsp:].mean()-r[:bsp].mean())/(r[:bsp].mean()+eps) if 0<bsp<12 else 0.0
+    else:
+        f["cusum_range_pct_12m"]=0.0; f["regime_change_magnitude_12m"]=0.0; f["regime_change_direction_12m"]=0.0
+    if tenure>=24:
+        f["regime_shift_24m"]=(history[-12:].mean()-history[-24:-12].mean())/(history[-24:-12].mean()+eps)
+    else:
+        f["regime_shift_24m"]=0.0
+
+    # Recency
+    lv=history[-1]
+    f["last_vs_mean_12m"]=lv/(f["mean_12m"]+eps); f["last_vs_lifetime_mean"]=lv/(f["lifetime_mean"]+eps)
+
+    # Percentiles
+    for p in [10,25,50,75,90]:
+        f[f"pctl_{p}_pct_mean_12m"]=np.percentile(r12,p)/(r12.mean()+eps)
+
+    # Concentration
+    sd=np.sort(r12)[::-1]; t12=r12.sum()+eps
+    f["top1_month_share"]=sd[0]/t12; f["top3_month_share"]=sd[:min(3,len(sd))].sum()/t12
+
+    # Log
+    f["log_mean_12m"]=np.log1p(max(f["mean_12m"],0))
+    f["log_sum_12m"]=np.log1p(max(f["sum_12m"],0))
+    f["log_lifetime_mean"]=np.log1p(max(f["lifetime_mean"],0))
+
+    # Autocorrelation
+    if tenure>=6:
+        r=_safe_window(history,min(tenure,24)); mr=r.mean(); vr=np.var(r)+eps
+        for lag in [1,2,3,6,12]:
+            f[f"autocorr_lag{lag}"]=np.mean((r[lag:]-mr)*(r[:-lag]-mr))/vr if len(r)>lag else 0.0
+    else:
+        for lag in [1,2,3,6,12]: f[f"autocorr_lag{lag}"]=0.0
+
+    # Vol change
+    if tenure>=12:
+        f["vol_change_6m"]=(history[-6:].std()-history[-12:-6].std())/(history[-12:-6].std()+eps)
+    else:
+        f["vol_change_6m"]=0.0
+
+    # Extreme values
+    f["max_vs_mean_12m"]=r12.max()/(r12.mean()+eps); f["min_vs_mean_12m"]=r12.min()/(r12.mean()+eps)
+    f["range_pct_12m"]=(r12.max()-r12.min())/(r12.mean()+eps)
+    f["months_since_lifetime_max"]=tenure-1-np.argmax(history)
+    f["months_since_lifetime_min"]=tenure-1-np.argmin(history)
+    f["lifetime_max_vs_mean"]=history.max()/(history.mean()+eps)
+
+    return f
+
+print(f"Feature function loaded. Sample feature count: {len(make_features(np.ones(36), 35, pd.Timestamp('2025-01-01')))}")
+
+
+# =============================================================================
+# CELL 4: Build training data with seasonal naive error labels
+# =============================================================================
+
+# Settings — adjust these
+MIN_HISTORY = 12
+FORECAST_HORIZON = 12
+MAX_ORIGINS = 6
+ERROR_THRESHOLD = 0.10  # 10%: naive is "accurate" if APE < this
+
+NON_FEAT_COLS = {"tin", "origin_date", "target", "snaive", "log_snaive",
+                 "log_actual", "residual", "snaive_ape", "error_class"}
+
+all_rows = []
+for tin, grp in df.groupby("tin"):
+    grp = grp.sort_values("ds").reset_index(drop=True)
+    cf, dates = grp["y"].values, grp["ds"].values
+    n = len(cf)
+    first_o = MIN_HISTORY - 1
+    last_o = n - FORECAST_HORIZON - 1
+    if first_o > last_o:
+        continue
+    origins = list(range(first_o, last_o + 1))
+    if len(origins) > MAX_ORIGINS:
+        origins = origins[-MAX_ORIGINS:]
+    for oidx in origins:
+        actual = cf[oidx + 1: oidx + 1 + FORECAST_HORIZON].sum()
+        hist = cf[:oidx + 1]
+        snaive = hist[-min(12, len(hist)):].sum()
+
+        feats = make_features(cf, oidx, pd.Timestamp(dates[oidx]))
+        feats["tin"] = tin
+        feats["origin_date"] = pd.Timestamp(dates[oidx])
+        feats["target"] = actual
+        feats["snaive"] = snaive
+        feats["log_snaive"] = np.log1p(max(snaive, 0))
+        feats["log_actual"] = np.log1p(max(actual, 0))
+        feats["residual"] = np.log1p(max(actual, 0)) - np.log1p(max(snaive, 0))
+
+        # Classification label: how wrong was naive?
+        snaive_ape = abs(actual - snaive) / (abs(actual) + 1e-9)
+        feats["snaive_ape"] = snaive_ape
+
+        if snaive_ape <= ERROR_THRESHOLD:
+            feats["error_class"] = "accurate"        # naive is close enough
+        elif snaive > actual:
+            feats["error_class"] = "overestimate"     # naive predicted too high
+        else:
+            feats["error_class"] = "underestimate"    # naive predicted too low
+
+        all_rows.append(feats)
+
+train_data = pd.DataFrame(all_rows)
+feat_cols = [c for c in train_data.columns if c not in NON_FEAT_COLS]
+
+print(f"Training rows: {len(train_data)}")
+print(f"Feature columns: {len(feat_cols)}")
+print(f"\nError class distribution:")
+print(train_data["error_class"].value_counts().to_string())
+print(f"\nSeasonal naive APE distribution:")
+for p in [0, 10, 25, 50, 75, 90, 100]:
+    print(f"  P{p:3d}: {train_data['snaive_ape'].quantile(p/100):.4f} ({train_data['snaive_ape'].quantile(p/100)*100:.2f}%)")
+print(f"\nResidual distribution:")
+print(f"  min: {train_data['residual'].min():.4f}, median: {train_data['residual'].median():.4f}, max: {train_data['residual'].max():.4f}")
+
+save(train_data, "02_train_data")
+save(feat_cols, "02_feat_cols")
+
+
+# =============================================================================
+# CELL 5: Train the classifier (LightGBM multiclass)
+# =============================================================================
+
+train_data = load("02_train_data")
+feat_cols = load("02_feat_cols")
+
+# Encode classes
+class_map = {"accurate": 0, "overestimate": 1, "underestimate": 2}
+class_names = ["accurate", "overestimate", "underestimate"]
+train_data["error_class_id"] = train_data["error_class"].map(class_map)
+
+# Internal 70/30 split for early stopping
+sorted_dates = sorted(train_data["origin_date"].unique())
+cutoff = sorted_dates[max(1, int(len(sorted_dates) * 0.7)) - 1]
+tr = train_data[train_data["origin_date"] <= cutoff]
+va = train_data[train_data["origin_date"] > cutoff]
+print(f"Classifier train: {len(tr)} rows, val: {len(va)} rows")
+
+X_tr, y_tr = tr[feat_cols].values, tr["error_class_id"].values
+X_va, y_va = va[feat_cols].values, va["error_class_id"].values
+
+# Handle NaN/Inf
+X_tr = np.nan_to_num(X_tr, nan=0.0, posinf=0.0, neginf=0.0)
+X_va = np.nan_to_num(X_va, nan=0.0, posinf=0.0, neginf=0.0)
+
+clf_params = {
+    "objective": "multiclass",
+    "num_class": 3,
+    "metric": "multi_logloss",
+    "learning_rate": 0.05,
+    "num_leaves": 31,
+    "max_depth": 6,
+    "min_child_samples": 30,
+    "feature_fraction": 0.7,
+    "bagging_fraction": 0.8,
+    "bagging_freq": 5,
+    "reg_alpha": 0.1,
+    "reg_lambda": 1.0,
+    "verbosity": -1,
+    "seed": 42,
+}
+
+dtrain = lgb.Dataset(X_tr, label=y_tr, feature_name=feat_cols, free_raw_data=False)
+dval = lgb.Dataset(X_va, label=y_va, feature_name=feat_cols, reference=dtrain, free_raw_data=False)
+
+clf_model = lgb.train(
+    clf_params, dtrain, num_boost_round=1000,
+    valid_sets=[dval], valid_names=["val"],
+    callbacks=[lgb.early_stopping(30), lgb.log_evaluation(100)],
+)
+print(f"\nBest iteration: {clf_model.best_iteration}")
+
+# Evaluate on val
+va_probs = clf_model.predict(X_va, num_iteration=clf_model.best_iteration)
+va_pred_class = va_probs.argmax(axis=1)
+
+print(f"\nClassification report (validation):")
+print(classification_report(y_va, va_pred_class, target_names=class_names))
+print(f"Confusion matrix:")
+print(pd.DataFrame(confusion_matrix(y_va, va_pred_class),
+                    index=[f"actual_{c}" for c in class_names],
+                    columns=[f"pred_{c}" for c in class_names]))
+
+# Feature importance for classifier
+clf_imp = pd.DataFrame({
+    "feature": clf_model.feature_name(),
+    "importance": clf_model.feature_importance(importance_type="gain"),
+}).sort_values("importance", ascending=False)
+print(f"\nTop 20 classifier features:")
+for _, r in clf_imp.head(20).iterrows():
+    print(f"  {r['feature']:40s} {r['importance']:.1f}")
+
+save(clf_model, "03_classifier_model")
+save(clf_imp, "03_classifier_importance")
+save(class_map, "03_class_map")
+
+
+# =============================================================================
+# CELL 6: Train correction models per class
+# =============================================================================
+
+train_data = load("02_train_data")
+feat_cols = load("02_feat_cols")
+
+# One Lasso model per error class, learning the log-space residual
+correction_models = {}
+
+for cls_name in ["accurate", "overestimate", "underestimate"]:
+    cls_data = train_data[train_data["error_class"] == cls_name]
+    print(f"\n{'='*50}")
+    print(f"Class: {cls_name} ({len(cls_data)} rows, {cls_data['tin'].nunique()} tins)")
+    print(f"{'='*50}")
+
+    if len(cls_data) < 20:
+        print(f"  Too few rows → no correction (forecast = naive)")
+        correction_models[cls_name] = {"type": "naive_only"}
+        continue
+
+    X = cls_data[feat_cols].values
+    y = cls_data["residual"].values  # log(actual) - log(naive)
+
+    # Standardize
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+    X_scaled = np.nan_to_num(X_scaled, nan=0.0, posinf=0.0, neginf=0.0)
+
+    # Different alpha per class:
+    # - accurate: high alpha (strong regularization, barely adjust)
+    # - over/underestimate: lower alpha (allow meaningful correction)
+    alpha = 0.1 if cls_name == "accurate" else 0.01
+
+    model = Lasso(alpha=alpha, fit_intercept=True, max_iter=5000)
+    model.fit(X_scaled, y)
+
+    pred = model.predict(X_scaled)
+    mae_naive = np.mean(np.abs(y))           # MAE if we predicted 0 (pure naive)
+    mae_model = np.mean(np.abs(y - pred))     # MAE with correction
+
+    nonzero = np.sum(np.abs(model.coef_) > 1e-6)
+    coef_df = pd.DataFrame({"feature": feat_cols, "coef": model.coef_}).sort_values("coef", key=abs, ascending=False)
+    top5 = coef_df[coef_df["coef"].abs() > 1e-6].head(5)
+
+    print(f"  Residual stats: mean={y.mean():.4f}, std={y.std():.4f}")
+    print(f"  MAE: naive={mae_naive:.4f}, model={mae_model:.4f} (improvement: {(1-mae_model/mae_naive)*100:.1f}%)")
+    print(f"  Intercept: {model.intercept_:.4f}")
+    print(f"  Nonzero coefs: {nonzero} / {len(feat_cols)}")
+    print(f"  Top features:")
+    for _, r in top5.iterrows():
+        print(f"    {r['feature']:40s} {r['coef']:+.4f}")
+
+    correction_models[cls_name] = {
+        "type": "lasso",
+        "model": model,
+        "scaler": scaler,
+        "alpha": alpha,
+        "nonzero_coefs": nonzero,
+        "coefficients": coef_df,
+    }
+
+save(correction_models, "04_correction_models")
+
+
+# =============================================================================
+# CELL 7: Build inference features + classify + correct + forecast
+# =============================================================================
+
+df = load("01_prepared_data")
+clf_model = load("03_classifier_model")
+class_map = load("03_class_map")
+correction_models = load("04_correction_models")
+feat_cols = load("02_feat_cols")
+
+class_names = ["accurate", "overestimate", "underestimate"]
+
+# Build inference features (one row per tin, all history)
+inf_rows = []
+for tin, grp in df.groupby("tin"):
+    grp = grp.sort_values("ds").reset_index(drop=True)
+    cf, dates = grp["y"].values, grp["ds"].values
+    oidx = len(cf) - 1
+    od = pd.Timestamp(dates[oidx])
+    feats = make_features(cf, oidx, od)
+    base_12m = cf[-min(12, len(cf)):].sum()
+    feats["tin"] = tin
+    feats["origin_date"] = od
+    feats["snaive"] = base_12m
+    feats["log_snaive"] = np.log1p(max(base_12m, 0))
+    inf_rows.append(feats)
+
+inf = pd.DataFrame(inf_rows)
+print(f"Inference: {len(inf)} tins")
+
+# Classify
+X_inf = inf[feat_cols].values
+X_inf = np.nan_to_num(X_inf, nan=0.0, posinf=0.0, neginf=0.0)
+
+probs = clf_model.predict(X_inf, num_iteration=clf_model.best_iteration)
+pred_class_id = probs.argmax(axis=1)
+pred_class_name = [class_names[i] for i in pred_class_id]
+pred_confidence = probs.max(axis=1)
+
+inf["predicted_class"] = pred_class_name
+inf["class_confidence"] = pred_confidence
+
+print(f"\nPredicted class distribution:")
+print(pd.Series(pred_class_name).value_counts().to_string())
+print(f"\nConfidence stats: mean={pred_confidence.mean():.3f}, min={pred_confidence.min():.3f}")
+
+# Apply correction per class
+corrections = np.zeros(len(inf))
+
+for cls_name in class_names:
+    mask = (inf["predicted_class"] == cls_name).values
+    n_cls = mask.sum()
+    if n_cls == 0:
+        continue
+
+    cm = correction_models[cls_name]
+    if cm["type"] == "naive_only":
+        corrections[mask] = 0.0
+        print(f"  [{cls_name:15s}] {n_cls:5d} tins → no correction")
+    else:
+        model = cm["model"]
+        scaler = cm["scaler"]
+        X_cls = X_inf[mask]
+        X_cls_scaled = scaler.transform(X_cls)
+        X_cls_scaled = np.nan_to_num(X_cls_scaled, nan=0.0, posinf=0.0, neginf=0.0)
+        pred_correction = model.predict(X_cls_scaled)
+        corrections[mask] = pred_correction
+        print(f"  [{cls_name:15s}] {n_cls:5d} tins → correction: "
+              f"min={pred_correction.min():+.4f}, median={np.median(pred_correction):+.4f}, "
+              f"max={pred_correction.max():+.4f}")
+
+# Final forecast = expm1(log1p(snaive) + correction)
+log_snaive = inf["log_snaive"].values
+log_forecast = log_snaive + corrections
+forecast = np.expm1(log_forecast)
+forecast = np.maximum(forecast, 0)
+
+inf["correction"] = corrections
+inf["forecast_12m_sum"] = forecast
+
+# Build output
+forecasts = inf[["tin", "origin_date", "snaive", "predicted_class",
+                  "class_confidence", "correction", "forecast_12m_sum"]].copy()
+forecasts = forecasts.rename(columns={"snaive": "snaive_12m"})
+
+print(f"\n{'='*60}")
+print(f"FORECAST SUMMARY")
+print(f"{'='*60}")
+print(f"  Tins: {len(forecasts)}")
+print(f"  Snaive range:   {forecasts['snaive_12m'].min():,.0f} to {forecasts['snaive_12m'].max():,.0f}")
+print(f"  Forecast range: {forecasts['forecast_12m_sum'].min():,.0f} to {forecasts['forecast_12m_sum'].max():,.0f}")
+
+pct_adj = (forecast - inf["snaive"].values) / (inf["snaive"].values + 1e-9) * 100
+print(f"\n  Adjustment by class:")
+print(f"  {'Class':15s} {'Count':>6s} {'Median Adj':>12s} {'P10':>10s} {'P90':>10s}")
+print(f"  {'-'*15} {'-'*6} {'-'*12} {'-'*10} {'-'*10}")
+for cls in class_names:
+    m = forecasts["predicted_class"] == cls
+    if m.sum() == 0: continue
+    a = pct_adj[m.values]
+    print(f"  {cls:15s} {m.sum():6d} {np.median(a):+11.1f}% {np.percentile(a,10):+9.1f}% {np.percentile(a,90):+9.1f}%")
+
+save(forecasts, "05_forecasts")
+save(inf, "05_inference_full")
+print(f"\nDone! Forecasts saved.")
+
+
+# =============================================================================
+# CELL 8: Inspect results
+# =============================================================================
+
+forecasts = load("05_forecasts")
+
+print("Sample forecasts:")
+print(forecasts.head(20).to_string(index=False))
+
+print(f"\nClass distribution:")
+print(forecasts["predicted_class"].value_counts().to_string())
+
+print(f"\nBy class stats:")
+for cls in ["accurate", "overestimate", "underestimate"]:
+    sub = forecasts[forecasts["predicted_class"] == cls]
+    if len(sub) == 0: continue
+    adj = (sub["forecast_12m_sum"] - sub["snaive_12m"]) / (sub["snaive_12m"] + 1e-9) * 100
+    print(f"\n  {cls} ({len(sub)} tins):")
+    print(f"    Median adjustment: {adj.median():+.1f}%")
+    print(f"    Confidence: {sub['class_confidence'].mean():.3f}")
+
+
+# =============================================================================
+# CELL 9: Evaluate against OOT (run after you have actuals)
+# =============================================================================
+
+# ── Uncomment and fill in with your actual OOT data ──
+# oot = pd.read_csv("oot_actuals.csv")  # columns: tin, actual_12m
+# forecasts = load("05_forecasts")
+#
+# merged = forecasts.merge(oot, on="tin")
+# merged["ape_naive"] = abs(merged["snaive_12m"] - merged["actual_12m"]) / abs(merged["actual_12m"])
+# merged["ape_model"] = abs(merged["forecast_12m_sum"] - merged["actual_12m"]) / abs(merged["actual_12m"])
+#
+# print("Overall:")
+# print(f"  Naive median APE:  {merged['ape_naive'].median():.4f} ({merged['ape_naive'].median()*100:.2f}%)")
+# print(f"  Model median APE:  {merged['ape_model'].median():.4f} ({merged['ape_model'].median()*100:.2f}%)")
+# print(f"  Model improved:    {(merged['ape_model'] < merged['ape_naive']).sum()} tins")
+# print(f"  Naive was better:  {(merged['ape_model'] > merged['ape_naive']).sum()} tins")
+#
+# print("\nBy predicted class:")
+# for cls in ["accurate", "overestimate", "underestimate"]:
+#     sub = merged[merged["predicted_class"] == cls]
+#     if len(sub) == 0: continue
+#     print(f"\n  {cls} ({len(sub)} tins):")
+#     print(f"    Naive median APE:  {sub['ape_naive'].median():.4f}")
+#     print(f"    Model median APE:  {sub['ape_model'].median():.4f}")
+#     print(f"    Model improved:    {(sub['ape_model'] < sub['ape_naive']).sum()} / {len(sub)}")
