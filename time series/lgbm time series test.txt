@@ -476,7 +476,7 @@ def make_features_for_tin(cashflows: np.ndarray, origin_idx: int, origin_date: p
 # 3. TRAINING / INFERENCE DATA BUILDERS
 # =============================================================================
 
-NON_FEATURE_COLS = {"tin", "origin_date", "target", "target_ratio", "base_12m"}
+NON_FEATURE_COLS = {"tin", "origin_date", "target", "target_log", "base_12m"}
 
 
 def get_feature_cols(df: pd.DataFrame) -> list:
@@ -484,6 +484,16 @@ def get_feature_cols(df: pd.DataFrame) -> list:
 
 
 def build_training_data(df, min_history_months=12, forecast_horizon=12, max_origins_per_tin=6):
+    """
+    Build training rows. Target is log(1 + next_12m_sum).
+    
+    Why log-target instead of ratio:
+      - Ratio breaks when base_12m is near zero (ratio → infinity)
+      - Log transform compresses the scale: log(100) ≈ 4.6, log(100000) ≈ 11.5
+        so a $100/month tin and $100K/month tin are only ~7 units apart instead of 1000×
+      - No division by base, so no near-zero denominator problem
+      - At inference, we exp() back to get the raw dollar forecast
+    """
     all_rows = []
     for tin, grp in df.groupby("tin"):
         grp = grp.sort_values("ds").reset_index(drop=True)
@@ -501,12 +511,11 @@ def build_training_data(df, min_history_months=12, forecast_horizon=12, max_orig
             od = pd.Timestamp(dates[oidx])
             feats = make_features_for_tin(cf, oidx, od)
             hist = cf[:oidx + 1]
-            t12 = hist[-min(12, len(hist)):].sum()
             feats["tin"] = tin
             feats["origin_date"] = od
             feats["target"] = target_raw
-            feats["base_12m"] = t12
-            feats["target_ratio"] = target_raw / (t12 + 1e-9)
+            feats["target_log"] = np.log1p(max(target_raw, 0))
+            feats["base_12m"] = hist[-min(12, len(hist)):].sum()
             all_rows.append(feats)
     return pd.DataFrame(all_rows)
 
@@ -600,13 +609,14 @@ def select_features(train_set, val_set, corr_threshold=0.95, min_importance_pct=
 
 def train_model(train_set, val_set, feature_cols, lgb_params=None, retrain_on_all=True):
     if lgb_params is None:
-        lgb_params = {"objective": "regression", "metric": "mae", "learning_rate": 0.05,
+        lgb_params = {"objective": "huber", "metric": "mae", "learning_rate": 0.05,
                       "num_leaves": 63, "max_depth": 6, "min_child_samples": 30,
                       "feature_fraction": 0.7, "bagging_fraction": 0.8, "bagging_freq": 5,
-                      "reg_alpha": 0.1, "reg_lambda": 1.0, "verbosity": -1, "n_jobs": -1, "seed": 42}
+                      "reg_alpha": 0.1, "reg_lambda": 1.0, "alpha": 0.5,
+                      "verbosity": -1, "n_jobs": -1, "seed": 42}
     cat_feats = [c for c in ["origin_month", "origin_quarter", "tenure_bucket"] if c in feature_cols]
-    dtrain = lgb.Dataset(train_set[feature_cols], label=train_set["target_ratio"], categorical_feature=cat_feats, free_raw_data=False)
-    dval = lgb.Dataset(val_set[feature_cols], label=val_set["target_ratio"], categorical_feature=cat_feats, reference=dtrain, free_raw_data=False)
+    dtrain = lgb.Dataset(train_set[feature_cols], label=train_set["target_log"], categorical_feature=cat_feats, free_raw_data=False)
+    dval = lgb.Dataset(val_set[feature_cols], label=val_set["target_log"], categorical_feature=cat_feats, reference=dtrain, free_raw_data=False)
     model = lgb.train(lgb_params, dtrain, num_boost_round=3000, valid_sets=[dtrain, dval], valid_names=["train", "val"],
                       callbacks=[lgb.early_stopping(50), lgb.log_evaluation(200)])
     best_iter = model.best_iteration
@@ -614,7 +624,7 @@ def train_model(train_set, val_set, feature_cols, lgb_params=None, retrain_on_al
     if retrain_on_all:
         print(f"  Retraining on ALL {len(train_set)+len(val_set)} rows with {best_iter} iterations...")
         all_data = pd.concat([train_set, val_set], ignore_index=True)
-        dall = lgb.Dataset(all_data[feature_cols], label=all_data["target_ratio"], categorical_feature=cat_feats, free_raw_data=False)
+        dall = lgb.Dataset(all_data[feature_cols], label=all_data["target_log"], categorical_feature=cat_feats, free_raw_data=False)
         model = lgb.train(lgb_params, dall, num_boost_round=best_iter, callbacks=[lgb.log_evaluation(0)])
         print(f"  Final model trained on {len(all_data)} rows.")
     return model
@@ -638,7 +648,7 @@ def run_pipeline(
     """
     Train on ALL data, forecast next 12m sum for each tin.
 
-    Returns: DataFrame [tin, origin_date, base_12m, predicted_ratio, forecast_12m_sum]
+    Returns: DataFrame [tin, origin_date, base_12m, forecast_12m_sum]
     """
     import pickle, os
 
@@ -664,6 +674,14 @@ def run_pipeline(
     print("\n" + "=" * 60 + "\nSTEP 2: Building training rows\n" + "=" * 60)
     train_data = build_training_data(df, min_history_months=min_history_months, max_origins_per_tin=max_origins_per_tin)
     print(f"  {len(train_data)} rows, {train_data['tin'].nunique()} tins, {len(get_feature_cols(train_data))} features")
+    tl = train_data["target_log"]
+    print(f"  target_log — min: {tl.min():.2f}, median: {tl.median():.2f}, max: {tl.max():.2f}")
+    print(f"  target (raw $) — min: {train_data['target'].min():,.0f}, "
+          f"median: {train_data['target'].median():,.0f}, "
+          f"max: {train_data['target'].max():,.0f}")
+    print(f"  base_12m — min: {train_data['base_12m'].min():,.0f}, "
+          f"median: {train_data['base_12m'].median():,.0f}, "
+          f"max: {train_data['base_12m'].max():,.0f}")
     _save(train_data, "02_train_data.pkl")
     if len(train_data) == 0: raise ValueError("No training rows.")
 
@@ -690,8 +708,8 @@ def run_pipeline(
         print("\n" + "=" * 60 + "\nSTEP 4: Feature Selection\n" + "=" * 60)
         drop = ["target", "base_12m"]
         keep = [c for c in train_set.columns if c not in drop]
-        ts = train_set[keep].rename(columns={"target_ratio": "target"})
-        vs = val_set[keep].rename(columns={"target_ratio": "target"})
+        ts = train_set[keep].rename(columns={"target_log": "target"})
+        vs = val_set[keep].rename(columns={"target_log": "target"})
         selected_features, selection_report = select_features(
             ts, vs, corr_threshold=corr_threshold, min_importance_pct=min_importance_pct, top_n=top_n_features)
         _save(selection_report, "05_selection_report.pkl")
@@ -713,12 +731,19 @@ def run_pipeline(
     # Step 7: Forecast
     print("\n" + "=" * 60 + "\nSTEP 7: Forecasting\n" + "=" * 60)
     inf = build_inference_data(df)
-    pred_ratio = model.predict(inf[selected_features])
-    inf["predicted_ratio"] = pred_ratio
-    inf["forecast_12m_sum"] = pred_ratio * inf["base_12m"]
-    forecasts = inf[["tin", "origin_date", "base_12m", "predicted_ratio", "forecast_12m_sum"]].copy()
-    print(f"  {len(forecasts)} tins | ratio: {pred_ratio.min():.3f} to {pred_ratio.max():.3f} | "
-          f"forecast: {forecasts['forecast_12m_sum'].min():,.0f} to {forecasts['forecast_12m_sum'].max():,.0f}")
+    pred_log = model.predict(inf[selected_features])
+
+    # Convert log prediction back to dollars: expm1(log) = raw dollar amount
+    forecast_12m = np.expm1(pred_log)
+    forecast_12m = np.maximum(forecast_12m, 0)  # floor at 0
+
+    inf["predicted_log"] = pred_log
+    inf["forecast_12m_sum"] = forecast_12m
+    forecasts = inf[["tin", "origin_date", "base_12m", "forecast_12m_sum"]].copy()
+    print(f"  {len(forecasts)} tins")
+    print(f"  predicted_log — min: {pred_log.min():.2f}, median: {np.median(pred_log):.2f}, max: {pred_log.max():.2f}")
+    print(f"  forecast_12m_sum — min: {forecast_12m.min():,.0f}, "
+          f"median: {np.median(forecast_12m):,.0f}, max: {forecast_12m.max():,.0f}")
     _save(inf, "09_inference_features.pkl")
     _save(forecasts, "10_forecasts.pkl")
 
